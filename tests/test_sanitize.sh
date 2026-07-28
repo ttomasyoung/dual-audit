@@ -27,6 +27,14 @@ plant a.md '/home/somebody/secret/path.txt' && bad "a personal home path was NOT
 plant b.md 'contact: someone@example.com'   && bad "an e-mail address was NOT caught"   || ok "an e-mail address is caught"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
 plant c.md 'fixed on 2026-07-24 after round three' && bad "an internal dated history note was NOT caught" || ok "a dated history note is caught"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
 plant d.md '这是一段中文说明'                && bad "non-English source text was NOT caught" || ok "non-English source text is caught"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
+
+# The release date. A changelog heading is the one place a date belongs in a public repository, and
+# every release produces one — so it is exempt by shape AND by file. Both halves are tested: the
+# exemption was written shape-only first, and a date dressed as a version heading then passed in any
+# file at all. A relaxation without its own bad case is how a gate quietly stops being one.
+plant CHANGELOG.md '## [0.1.0] — 2026-07-28' && ok "a changelog release heading is allowed" || bad "the release heading a real changelog needs is refused"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
+plant CHANGELOG.md 'Fixed on 2026-07-24 after the third review round.' && bad "a dated prose line in the changelog was NOT caught" || ok "a dated line elsewhere in the changelog is still caught"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
+plant docs.md '## [9.9.9] — 2026-07-24' && bad "a version heading in another file was NOT caught" || ok "the exemption does not apply outside the changelog"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
 plant e.md 'api_key = A1b2C3d4E5f6G7h8J9k0LmNo' && bad "an API key was NOT caught" || ok "an API-key assignment is caught"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
 plant f.md '-----BEGIN RSA PRIVATE KEY-----'  && bad "a private key was NOT caught"  || ok "a private key block is caught"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
 

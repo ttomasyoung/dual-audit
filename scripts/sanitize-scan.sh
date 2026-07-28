@@ -28,10 +28,11 @@ GREP_OPTS=(-rInE --binary-files=without-match
            --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.tmp
            --exclude=.private-terms)   # a packager's local vocabulary file is never shipped
 
-scan() { # scan <label> <extended-regex>
-  local label="$1" re="$2"
+scan() { # scan <label> <extended-regex> [exclude-extended-regex]
+  local label="$1" re="$2" excl="${3:-}"
   grep "${GREP_OPTS[@]}" -- "$re" "$ROOT" 2>/dev/null \
     | grep -vF "$MARK" \
+    | { if [ -n "$excl" ]; then grep -vE -- "$excl"; else cat; fi; } \
     | sed "s#^#[$label] #" >> "$RPT" || true
 }
 
@@ -51,7 +52,16 @@ scan email '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 
 # 4. Internal design and incident history. Public documentation describes how
 #    the system behaves, not the dated review log that produced it.
-scan history '(20[0-9]{2}-[01][0-9]-[0-3][0-9]|round [0-9]+ of the internal|incident log)'   # sanitize-scan:allow
+# A changelog release heading is the one place a date belongs in a public repository, and every
+# release will produce one. Exempting it structurally beats marking the line by hand each time: a
+# hand-written marker exempts the WHOLE line, and doing it every release trains the habit of adding
+# markers to whatever the scanner objects to. The exception is the Keep-a-Changelog heading shape and
+# nothing else — a dated line anywhere else in the file is still a finding.
+# Anchored to the FILE as well as the shape. Without the path anchor the exemption was shape-only,
+# so a date dressed as a version heading passed in ANY file — verified by probe before this line
+# existed. grep -rIn emits `path:line:content`, which is what the leading part matches.
+CHANGELOG_HEADING='CHANGELOG\.md:[0-9]+:#+ \[[0-9]+\.[0-9]+\.[0-9]+\] .*[0-9]{4}-[0-9]{2}-[0-9]{2} *$'
+scan history '(20[0-9]{2}-[01][0-9]-[0-3][0-9]|round [0-9]+ of the internal|incident log)' "$CHANGELOG_HEADING"   # sanitize-scan:allow
 
 # 5. Non-English source text outside the sanctioned translated documents.
 grep -rInP '[\x{3040}-\x{30ff}\x{4e00}-\x{9fff}\x{ac00}-\x{d7af}]' \
