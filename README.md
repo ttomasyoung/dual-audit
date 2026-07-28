@@ -4,6 +4,10 @@
 
 [中文说明 / Chinese README](README.zh-CN.md) · [Apache-2.0](LICENSE) · Linux (verified on Ubuntu 24.04) <!-- sanitize-scan:allow (the link label is intentionally in Chinese so Chinese readers find it) -->
 
+[![CI](https://github.com/ttomasyoung/dual-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/ttomasyoung/dual-audit/actions/workflows/ci.yml)
+[![Licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/tag/ttomasyoung/dual-audit?label=release&sort=semver)](https://github.com/ttomasyoung/dual-audit/releases)
+
 **Why this exists:** [Two Days of Nothing](WHY.md) — the account that led to it.
 
 ---
@@ -234,6 +238,37 @@ Security issues: [SECURITY.md](SECURITY.md).
 - Further optional domain profiles
 
 None of these may weaken this release's protocol, isolation or fail-closed behaviour.
+
+## Questions, problems, ideas
+
+- **Something is broken, or a gate fired when it should not have** — open an
+  [issue](https://github.com/ttomasyoung/dual-audit/issues). Include the terminal state, the
+  `convergence_status`, and what you expected. `dual-audit doctor` output helps.
+- **"Should I audit this?", "how do I write my critical areas?", or you want to argue with the
+  protocol** — that is a
+  [discussion](https://github.com/ttomasyoung/dual-audit/discussions), not a bug.
+- **You adapted it** — a single-model self-review, a macOS runtime, a domain profile — please say so
+  in a discussion. That is the point of the seed.
+- **Security** — see [SECURITY.md](SECURITY.md), not a public issue.
+
+## Acknowledgements
+
+The two reviewers were used on this repository throughout its own development, and both sides
+earned their place in it.
+
+**Codex** reviewed as the independent side. Working from the raw sources and without seeing the
+other side's conclusions, it found things the author's own tooling was structurally blind to —
+including a private identifier surviving in git history that the repository's own pre-publication
+scanner did not look for, a hole in the verdict grammar that let a stated blocker travel through the
+whole panel unread, and a delete path deriving its file list twice while comparing only the lengths.
+On several of those the author's side had argued the opposite and was wrong.
+
+**Claude** was the controller and the author's side of every panel, and wrote the code.
+
+Codex is deliberately not listed as a co-author of the commits. Attribution in git means "helped
+write this", and its role here was to review — which in a project built on the premise that the
+author and the verifier must not collapse into one is a distinction worth keeping visible rather
+than flattening into a contributor count.
 
 ## Licence
 
