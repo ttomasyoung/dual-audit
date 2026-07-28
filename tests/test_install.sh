@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Installation, doctor and removal tests. Everything happens inside a throwaway HOME, so this
-# can never touch the real one.
+# Installation, doctor and removal tests. Everything happens inside a throwaway HOME -- which means
+# HOME *and* every other variable that can redirect a write out of it: the XDG directories and the
+# DUAL_AUDIT_* location overrides. Pinning HOME alone was not enough, and the difference only showed
+# up on a machine that had XDG_CONFIG_HOME set.
 #
 # Exit codes are captured directly from the command under test, never from the tail of a pipe:
 # a pipeline reports the LAST command's status, so `install.sh | tail` would report tail's 0 and
@@ -12,6 +14,22 @@ REPO="$(cd "$HERE/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/dual-audit-home.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 export HOME="$T"
+# A throwaway HOME is only throwaway if nothing else points out of it. install.sh honours
+# XDG_CONFIG_HOME, XDG_DATA_HOME and the DUAL_AUDIT_* location overrides -- correctly; that is the
+# convention -- so on a machine where any of them is set, this suite installed into the REAL
+# configuration directory, and the purge test then deleted a real profile. The header above claimed
+# this "can never touch the real one", and that claim was false. Reproduced with a single
+# `XDG_CONFIG_HOME=/tmp/whatever bash tests/test_install.sh`.
+export XDG_CONFIG_HOME="$T/.config" XDG_DATA_HOME="$T/.local/share" XDG_STATE_HOME="$T/.local/state"
+unset CLAUDE_CONFIG_DIR DUAL_AUDIT_BIN_DIR DUAL_AUDIT_SHARE_DIR DUAL_AUDIT_CONFIG_DIR
+# A guard, not a comment. If the pinning above is ever dropped, this stops the run instead of quietly
+# writing outside the temporary directory again.
+for _v in HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME; do
+  case "${!_v}" in "$T"|"$T"/*) ;;
+    *) echo "FATAL: $_v=${!_v} points outside the throwaway home $T; refusing to run" >&2; exit 2 ;;
+  esac
+done
+unset _v
 export PATH="$T/.local/bin:$PATH"     # doctor treats a missing ~/.local/bin as a real problem
 export DUAL_AUDIT_TELEMETRY=""
 
