@@ -1,0 +1,76 @@
+# dual-audit:package-file (installed by dual-audit; ownership marker — do not remove)
+# dual-audit — YOUR profile.
+#
+# The installer copies this to ~/.config/dual-audit/profile.yaml and never overwrites it
+# afterwards. Edit that copy, then run:
+#
+#   dual-audit profile apply     # recompile it into the installed panel
+#   dual-audit doctor            # check it
+#
+# Until `customized` is true, AUTOMATIC ROUTING IS OFF: nothing is sent to a review because
+# a rule guessed that it should be. Explicitly asking for a review always works. This is
+# deliberate — a shipped default list of "important things" would either be so broad that it
+# audits everything, or so narrow that it gives false reassurance.
+
+version: 1
+
+# Which shipped profile to build on: `default` (domain neutral) or `research` (adds an
+# evidence-anchoring note to every brief).
+base: default
+
+# Set to true once critical_areas below describes YOUR work.
+customized: false
+
+# NOTE ON ROUTING: there is deliberately no `routing:` block in this file. The trigger lists live
+# in the base profile you chose above, and `dual-audit profile routing` prints the merged table the
+# controller actually uses. Add a `routing:` block here only if you want to replace that table
+# entirely — a partial one does not merge key by key, it replaces the whole thing.
+
+# ---------------------------------------------------------------------------
+# critical_areas — what a full dual audit is for, in your work.
+#
+# Each entry: a name, the keywords that identify it, and the route to take.
+# Keywords are matched by the controller against the request, not by a regular expression
+# engine, so write the words you would actually use. Short words (under three characters)
+# match far more than intended and `*` matches everything.
+#
+# Two example entries are given, both commented out. Replace them; do not just uncomment
+# them and hope.
+# ---------------------------------------------------------------------------
+critical_areas: []
+
+# critical_areas:
+#   - name: "Release and deployment"
+#     keywords: ["deploy", "release", "publish", "production rollout", "migration"]
+#     route: full
+#   - name: "Numbers that go into the report"
+#     keywords: ["headline figure", "summary statistic", "final table"]
+#     route: light
+
+# ---------------------------------------------------------------------------
+# projects — optional. When a caller passes `project: <id>`, the two strings below are
+# injected into the reviewers' briefs, and they are injected DIFFERENTLY on purpose:
+#
+#   rules — may state your project's working conclusions. Claude side only.
+#   docs  — ONLY the paths of your canonical documents. This is what the independent
+#           reviewer gets, so that it reads and judges the source itself instead of
+#           inheriting your conclusion. Handing conclusions to an "independent" reviewer
+#           turns it into a rubber stamp, which is the failure this whole tool exists to
+#           prevent.
+#
+# Use ABSOLUTE paths: the read-only reviewer runs from a neutral directory under a
+# restricted HOME, so `~` and relative paths silently read nothing.
+# ---------------------------------------------------------------------------
+projects: []
+
+# projects:
+#   - id: my-service
+#     rules: "Interface contract lives in /srv/my-service/docs/contract.md and wins on conflict. Version numbers in the changelog are authoritative."
+#     docs: "Read these yourself, do not assume the conclusions: /srv/my-service/docs/contract.md, /srv/my-service/README.md"
+
+# ---------------------------------------------------------------------------
+# evidence.brief_note — extra text appended to BOTH reviewers' briefs. Leave empty to use
+# whatever the chosen base profile provides.
+# ---------------------------------------------------------------------------
+evidence:
+  brief_note: ""
