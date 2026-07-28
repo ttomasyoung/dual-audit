@@ -59,7 +59,12 @@ tooling becomes expensive without becoming safer.
 - Linux (verified on Ubuntu 24.04)
 - Bash, Node 18+, and the usual utilities (`flock`, `mktemp`, `timeout`, `awk`, `sed`, `grep`, `find`, `sha256sum`)
 - [Claude Code](https://claude.com/claude-code) — the controller
-- The Codex CLI, authenticated — the independent reviewer
+- The Codex CLI, authenticated — the independent reviewer. It is a separate product from Claude
+  Code and most people arriving here will not have it yet: install it (`npm i -g @openai/codex`, or
+  see [the Codex CLI project](https://github.com/openai/codex)) and run `codex login`. "Authenticated"
+  concretely means a credential file at `~/.codex/auth.json`; `dual-audit doctor` reports whether the
+  CLI is found, and the reviewer wrapper refuses to run without the credential rather than producing
+  an empty review
 - `~/.local/bin` on your `PATH`
 
 No sudo. Everything installs under your home directory.
@@ -95,9 +100,15 @@ that left it empty, so it can never take anything else with it.
 
 ```bash
 $EDITOR ~/.config/dual-audit/profile.yaml
-dual-audit profile apply
-dual-audit doctor
+dual-audit profile apply      # compile it into the installed panel
+dual-audit doctor             # check it, and catch a profile edited but not applied
+dual-audit profile routing    # what will actually route now — read this before trusting it
 ```
+
+The file ships with two commented-out example areas. Replace them with your own; uncommenting them
+as they stand describes somebody else's work. `doctor` will tell you if `critical_areas` is still
+empty, if a keyword is short enough to match far more than you meant, and if you edited the profile
+without applying it.
 
 Until that file says `customized: true`, **automatic routing is off**: nothing is sent to a review
 because a rule guessed it was important. Explicitly asking for a review works from the start.

@@ -51,7 +51,10 @@
 - Linux（在 Ubuntu 24.04 上验证）
 - Bash、Node 18+，以及常用工具（`flock`、`mktemp`、`timeout`、`awk`、`sed`、`grep`、`find`、`sha256sum`）
 - [Claude Code](https://claude.com/claude-code)——控制器
-- 已登录的 Codex CLI——独立审查者
+- 已登录的 Codex CLI——独立审查者。它和 Claude Code 是两个独立产品，**多数循着这个项目找来的人还没有它**：
+  用 `npm i -g @openai/codex` 安装（或见 [Codex CLI 项目](https://github.com/openai/codex)），然后跑 `codex login`。
+  「已登录」具体是指存在凭据文件 `~/.codex/auth.json`；`dual-audit doctor` 会报告 CLI 是否找得到，
+  而审查者 wrapper 在没有凭据时会**拒绝运行**，不会产出一份空审查
 - `~/.local/bin` 在 `PATH` 里
 
 不需要 sudo，全部装在你的家目录下。
@@ -83,9 +86,14 @@ profile **文件**，只有在删完之后目录恰好空了才顺手把目录�
 
 ```bash
 $EDITOR ~/.config/dual-audit/profile.yaml
-dual-audit profile apply
-dual-audit doctor
+dual-audit profile apply      # 编译进已安装的面板
+dual-audit doctor             # 检查，并抓出"改了 profile 却忘了 apply"
+dual-audit profile routing    # 现在到底什么会被自动送审——信它之前先读这个
 ```
+
+文件里带两个**被注释掉的**示例区域。请替换成你自己的；原样取消注释，描述的是别人的工作。
+`doctor` 会告诉你：`critical_areas` 是不是还空着、某个关键词是不是短到会匹配远超预期、
+以及你是不是改了 profile 却没 apply。
 
 在那个文件写上 `customized: true` 之前，**自动路由是关的**：不会因为某条规则「猜」某件事重要
 就把它送去审查。而**显式要求审查从一开始就能用**。
