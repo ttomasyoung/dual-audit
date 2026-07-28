@@ -4,6 +4,8 @@
 
 [English README](README.md) · [Apache-2.0](LICENSE) · Linux（在 Ubuntu 24.04 上验证）
 
+**它为什么存在：**[白干的两天](WHY.zh-CN.md) —— 促成这件事的那段经历。
+
 ---
 
 ## 要解决的问题

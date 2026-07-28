@@ -4,6 +4,8 @@
 
 [中文说明 / Chinese README](README.zh-CN.md) · [Apache-2.0](LICENSE) · Linux (verified on Ubuntu 24.04) <!-- sanitize-scan:allow (the link label is intentionally in Chinese so Chinese readers find it) -->
 
+**Why this exists:** [Two Days of Nothing](WHY.md) — the account that led to it.
+
 ---
 
 ## The problem
