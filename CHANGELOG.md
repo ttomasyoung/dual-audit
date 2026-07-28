@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-07-28
+
+### Fixed
+
+- **The installation test suite could write outside its throwaway home.** It pinned `HOME` and
+  nothing else, while `install.sh` honours `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and the `DUAL_AUDIT_*`
+  location overrides — correctly; that is the convention. On a machine with any of them set, the
+  suite installed into the real configuration directory, and the `--purge-profile` case then deleted
+  a real profile. The suite's own header claimed this "can never touch the real one". CI found it on
+  the first push; it reproduces with `XDG_CONFIG_HOME=/tmp/anything bash tests/test_install.sh`.
+  All of them are now pinned inside the temporary home, with a guard that stops the run if that
+  pinning is ever removed. The installer itself was not at fault and is unchanged.
+
 ## [0.1.0] — 2026-07-28
 
 First public release. The protocol core is an extraction of a working implementation, generalised,
