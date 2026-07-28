@@ -22,6 +22,16 @@ All notable changes to this project are documented here. This project follows
   in the wrapper tests. `cd` without a failure branch in the test runner is fixed too. The remaining
   two are a literal `~` inside a message a human reads, which is deliberate and now carries a scoped
   exemption with its reason.
+- **CI never made the decision the identity gate asks for.** That gate fails closed by design:
+  publishing under your own name is a fine decision, but it has to be one somebody made and wrote
+  down. Nothing had written it down for CI, so the pre-publication scan refused every run — working
+  exactly as intended, and reading as a broken check. The workflow now carries the approval, which
+  also means a fork sees its own identity refused until it changes that line.
+
+Also worth recording, because it is the same mistake this project is about: the local verification
+that preceded the first release was not the check CI runs. It supplied `EXTRA_PATTERNS` and
+`DUAL_AUDIT_ALLOW_GIT_IDENTITY`; CI supplies neither. Green locally and red in CI were both correct
+answers to different questions.
 
 ## [0.1.0] — 2026-07-28
 
