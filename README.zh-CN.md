@@ -4,6 +4,10 @@
 
 [English README](README.md) · [Apache-2.0](LICENSE) · Linux（在 Ubuntu 24.04 上验证）
 
+[![CI](https://github.com/ttomasyoung/dual-audit/actions/workflows/ci.yml/badge.svg)](https://github.com/ttomasyoung/dual-audit/actions/workflows/ci.yml)
+[![Licence](https://img.shields.io/badge/licence-Apache--2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/tag/ttomasyoung/dual-audit?label=release&sort=semver)](https://github.com/ttomasyoung/dual-audit/releases)
+
 **它为什么存在：**[白干的两天](WHY.zh-CN.md) —— 促成这件事的那段经历。
 
 ---
@@ -203,6 +207,32 @@ Workflow({
 - 更多可选领域 profile
 
 以上任何一项都不得削弱本版的协议、隔离与 fail-closed 行为。
+
+## 有问题、有想法
+
+- **坏了，或者某道门不该拦却拦了** —— 开
+  [issue](https://github.com/ttomasyoung/dual-audit/issues)。请附上终态、`convergence_status`、
+  以及你期望的结果；`dual-audit doctor` 的输出也很有用。
+- **"这件事该不该审"、"critical_areas 怎么写"、或者你想跟这套协议吵一架** —— 那是
+  [discussion](https://github.com/ttomasyoung/dual-audit/discussions)，不是 bug。
+- **你改造了它** —— 单模型自我双审、macOS 适配、领域 profile —— 请在 discussion 里说一声。
+  **种子就是为这个撒的。**
+- **安全问题** —— 见 [SECURITY.md](SECURITY.md)，不要开公开 issue。
+
+## 致谢
+
+这两个审查者在本仓库自己的开发过程中被反复使用，两边都实打实挣到了自己的位置。
+
+**Codex** 作为独立的一侧参与审查。它只读原始材料、看不到另一侧的结论，因而找出了作者自己的工具
+**结构上不可能发现**的东西——包括一个残存在 git 历史里的私有标识（本仓库自带的发布前扫描器压根
+不查这一类）、裁决文法里的一个洞（能让一条写明的阻断项穿过整个面板没人读）、以及删除路径把文件
+清单推导了两次却只比较长度。其中数次，作者一侧的判断与之相反，而且是错的。
+
+**Claude** 是控制器、是每一轮面板里作者的那一侧，也写了这些代码。
+
+**刻意没有把 Codex 列为 commit 的 co-author。** 在 git 里署名的含义是"参与编写"，而它在这里的角色是
+**审查**——在一个以"作者与验证者不可塌缩"为前提的项目里，这条界线值得保持可见，而不是被压平成
+一个贡献者计数。
 
 ## 许可
 
