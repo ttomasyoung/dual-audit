@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `WHY.md` and `WHY.zh-CN.md` — the author's account of what went wrong before this existed, and
+  why the answer turned out not to be "find a smarter model". Linked from both READMEs, because
+  most people reading a README first want to know why the thing was built at all.
+
 ## [0.1.1] — 2026-07-28
 
 ### Fixed
