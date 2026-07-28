@@ -6,7 +6,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-cd "$REPO"
+cd "$REPO" || { echo "cannot enter $REPO" >&2; exit 2; }
 
 failed=()
 run() { # run <label> <command...>

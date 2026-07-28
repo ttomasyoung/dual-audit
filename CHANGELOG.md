@@ -15,6 +15,13 @@ All notable changes to this project are documented here. This project follows
   the first push; it reproduces with `XDG_CONFIG_HOME=/tmp/anything bash tests/test_install.sh`.
   All of them are now pinned inside the temporary home, with a guard that stops the run if that
   pinning is ever removed. The installer itself was not at fault and is unchanged.
+- **The shell lint step had never passed**, on any commit, so the checks were not protecting
+  anything. Four of the five findings were real, and two of them are the failure this package exists
+  to make loud: `local x="$(cmd)"` makes the exit status of `local` the status of the line and
+  discards the command's own. Declared and assigned separately now, in the wrapper's telemetry and
+  in the wrapper tests. `cd` without a failure branch in the test runner is fixed too. The remaining
+  two are a literal `~` inside a message a human reads, which is deliberate and now carries a scoped
+  exemption with its reason.
 
 ## [0.1.0] — 2026-07-28
 

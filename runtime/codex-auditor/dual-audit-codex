@@ -301,7 +301,11 @@ _tm_rotate(){ local _sz; _sz=$(stat -c%s "$TM_FILE" 2>/dev/null || echo 0)
 _tm(){   # $1=event, remaining arguments are pre-formed JSON fragments
   [ "$TM_ON" = 1 ] || return 0
   local _ev="$1"; shift
-  local _line="{\"v\":2,\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)\",\"event\":\"$_ev\",\"run_id\":\"$TM_RUN_ID\"$*}"
+  # Declared first, assigned second: `local x="$(cmd)"` makes the exit status of `local` the status
+  # of the line and silently discards the command's own. Masking an exit status is the exact failure
+  # this program exists to make loud, so it does not get to do it in its own telemetry.
+  local _ts; _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  local _line="{\"v\":2,\"ts\":\"$_ts\",\"event\":\"$_ev\",\"run_id\":\"$TM_RUN_ID\"$*}"
   [ "${#_line}" -gt 2048 ] && return 0                                  # over-long lines are dropped rather than truncated into half a JSON record
   { if exec 201>>"$TM_LOCK" 2>/dev/null && flock -w 0.25 201 2>/dev/null; then
       _tm_rotate; printf '%s\n' "$_line" >> "$TM_FILE" 2>/dev/null; exec 201>&-

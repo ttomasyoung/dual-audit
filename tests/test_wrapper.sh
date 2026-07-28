@@ -8,7 +8,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 W="$HERE/../runtime/codex-auditor/dual-audit-codex"
 # Keep every artefact of this test out of the user's real runtime directory.
-export DUAL_AUDIT_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dual-audit-test.XXXXXX")"
+DUAL_AUDIT_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dual-audit-test.XXXXXX")" || exit 2
+export DUAL_AUDIT_RUNTIME_DIR
 export DUAL_AUDIT_TELEMETRY=""
 trap 'rm -rf "$DUAL_AUDIT_RUNTIME_DIR"' EXIT
 

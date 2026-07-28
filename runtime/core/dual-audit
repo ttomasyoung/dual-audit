@@ -176,6 +176,9 @@ cmd_doctor() {
     say_bad "no manifest at $MANIFEST — run install.sh"
   fi
 
+  # The tilde in the two messages below is TEXT the reader sees, not a path this script expands:
+  # printing the literal "~/.local/bin" is what a user recognises. The comparison itself uses $HOME.
+  # shellcheck disable=SC2088
   case ":$PATH:" in
     *":$HOME/.local/bin:"*) say_ok "~/.local/bin is on PATH" ;;
     *) say_bad "~/.local/bin is NOT on PATH — the reviewer wrapper will not be found. Add: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
