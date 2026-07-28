@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] — unreleased
+## [0.1.0] — 2026-07-28
 
 First public release. The protocol core is an extraction of a working implementation, generalised,
 de-domained and re-verified for public use.
