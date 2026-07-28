@@ -6,7 +6,12 @@
 - Bash and Node 18 or newer.
 - `flock`, `mktemp`, `timeout`, `awk`, `sed`, `grep`, `find`, `sha256sum`.
 - Claude Code, as the controller.
-- The Codex CLI, authenticated, as the independent reviewer.
+- The Codex CLI, authenticated, as the independent reviewer. Separate from Claude Code, and the
+  half most people arriving here are missing: `npm i -g @openai/codex` (or see
+  <https://github.com/openai/codex>), then `codex login`. The wrapper reads the credential from
+  `~/.codex/auth.json`, falling back to `~/.codex-cli/auth.json`. Without it the wrapper refuses to
+  run — it does not produce an empty review, because an empty review is indistinguishable from a
+  clean one.
 - `~/.local/bin` on your `PATH`.
 
 No sudo, ever. Everything lives under your home directory.
