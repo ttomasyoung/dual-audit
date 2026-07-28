@@ -66,6 +66,12 @@ jobs:
             tests/*.sh
 
       - name: No secrets, personal paths, e-mail or non-English source text
+        # The identity gate fails closed on purpose: publishing under your own name is a fine
+        # decision, but it has to BE a decision, recorded somewhere a reader can see. Here is where
+        # this repository records it. Anyone forking this will see their own identity refused until
+        # they change this line, which is the intended behaviour and not a bug to work around.
+        env:
+          DUAL_AUDIT_ALLOW_GIT_IDENTITY: 'ttomasyoung <163614498+ttomasyoung@users.noreply.github.com>'   # sanitize-scan:allow (an approval string necessarily contains the address it approves)
         run: bash scripts/sanitize-scan.sh
 
   install:
