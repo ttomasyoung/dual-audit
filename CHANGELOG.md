@@ -352,12 +352,36 @@ EVIDENCE: read 3 files<br>P0: the delete path removes user data
 ```
 
 converged as an approval with no unresolved blockers. A stated blocker travelled through the entire
-panel unread, which is the one outcome the whole design exists to prevent. A value hiding one of the
-three fields that decide the round — `P0`, `VERDICT`, `VERIFIED` — now invalidates the block. It is
-narrowed to those three deliberately: prose in a `DELTA` or `RECOMMEND` that happens to mention
-another field name costs a round for nothing, and a gate that fires on everything is not a gate.
-Folding a *bullet* that names a field is unchanged, because that path captures the blocker into its
-own field rather than losing it.
+panel unread, which is the one outcome the whole design exists to prevent.
+
+The first attempt at this was wrong in both directions, and both are worth recording because the
+second attempt is shaped by them. It refused any value naming `P0`, `VERDICT` or `VERIFIED`, and it
+only looked at lines the parser had already recognised. So:
+
+- **It still leaked.** `**P0**: x`, `note P0: x`, `(P0: x)` and `P0 (blocking): x` are not lines this
+  parser recognises, so they landed in the "unparsed" list, which a comment declared did not affect
+  validity — and the round converged. A colon variant did the same from inside a recognised value:
+  `P0： x` differs from the refused ASCII form by one character and passed with no warning at all.
+  Naming those five shapes and matching them too would have been the same mistake a sixth time.
+- **It also over-refused.** Measured against 76 real verdicts: 15 of them — one in five — were
+  ordinary prose. Reviewers discuss these fields constantly ("that is `VERIFIED: fail`, an honest
+  'I could not verify'"; quoting a log line; explaining what P0 means). A gate that refuses one
+  honest verdict in five is a tax, not a protection.
+
+What ships is two rules instead of one:
+
+1. **A line inside the block that the parser cannot read makes the block invalid** — which is what
+   the prompt has always promised ("EVERY line inside the block must be one of the listed fields...
+   no prose lines, no bullets, no continuation lines, no notes"). Machine marker lines are exempt,
+   because the wrapper writes its exit code inside every block. This closes the prefix shapes as a
+   class rather than one at a time. Cost measured on the same 76 verdicts: **zero** contained one.
+2. **A value naming `P0` invalidates the block only when this block's own `P0` says nothing.**
+   `VERDICT` and `VERIFIED` are enumerated fields checked against their own token lists, so no
+   blocker can hide in them; a blocker can only be lost when the field that carries blockers is
+   empty. Same 76 verdicts: **one** refusal, 1%.
+
+Folding a *bullet* that names a field is unchanged — that path captures the blocker into its own
+field rather than losing it.
 
 Rough edge, stated rather than hidden: a round-1 verdict rejected this way surfaces later as
 `prior_state_schema_invalid`, which is fail-closed and never an approval, but names the symptom
