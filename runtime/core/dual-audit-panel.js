@@ -666,7 +666,26 @@ function parseSentinel(text) {
  // a stated blocker was carried through the whole panel unread. The prompt promises this is refused
  // rather than reinterpreted; it now is. Narrowed to the gating three on purpose: ordinary prose in a
  // DELTA or RECOMMEND that mentions EVIDENCE or P1 costs a round for nothing.
-  const VALUE_HIDES_GATING = /(?:P0|VERDICT|VERIFIED)\s*:/i
+ // Colon VARIANTS count. A full-width colon reads as a colon to every human and to the reviewer that
+ // wrote it, but not to an ASCII-only pattern: `EVIDENCE: ...<br>P0： blocker` differed from the
+ // refused ASCII version by one character and converged with no warning at all — the quietest
+ // possible way to lose a blocker.
+  const COLON = '[:\uFF1A\uFE55\uFE13\u2236]'
+ // ONLY `P0`, and only when this block's own P0 says nothing. The first version of this rule also
+ // fired on VERDICT and VERIFIED anywhere in any value, and measuring it against 76 real verdicts
+ // showed it refusing 15 of them -- one in five -- all of them ordinary prose: a reviewer writing
+ // "that is VERIFIED: fail, an honest 'I could not verify'", or quoting a log line, or explaining
+ // what P0 means. A gate that refuses one honest verdict in five is not protection, it is a tax, and
+ // reviewers would learn to work around it. VERDICT and VERIFIED are enumerated fields validated
+ // against their own token lists, so no blocker can hide in them; the only thing that can be lost is
+ // a BLOCKER, and a blocker can only be lost when the field that carries blockers says there are
+ // none. Same 76 verdicts under the narrowed rule: one refusal, 1%.
+  const VALUE_HIDES_GATING = new RegExp('P0\\s*' + COLON, 'i')
+ // Lines the wrapper injects are machine output, not reviewer prose, and they are the one thing that
+ // legitimately appears inside a block without being a field. Exempting them is load-bearing: the
+ // exit-code marker sits inside every reviewer block, so treating it as a foreign line would refuse
+ // every verdict the wrapper ever produced.
+  const MARKER_LINE = /^[ \t]*__[A-Z][A-Z0-9_]*=/
  // A BULLET or INDENTED CONTINUATION that names a field is FOLDED INTO that field -- it is neither
  // ignored nor treated as invalidating the block. Ignoring it silently drops a real blocker such as
  // `- P0: real blocker`; invalidating the whole block is the single largest source of false
@@ -682,7 +701,7 @@ function parseSentinel(text) {
     if (!/^[ \t]*END[ \t]*$/.test(lines[lines.length - 1])) return null
  // Raw control characters are still refused: the check costs almost nothing and normal output has none.
     if (/[\u0000-\u0008\u000e-\u001f\u007f-\u009f]/.test(b)) return null
-    const fields = new Map(), unparsed = [], warnings = [], hidesGating = []
+    const fields = new Map(), unparsed = [], warnings = [], hidesGating = [], foreign = []
     let lastName = null
     for (let i = 0; i < lines.length - 1; i++) {
       const L = lines[i]
@@ -708,13 +727,21 @@ function parseSentinel(text) {
         if (VALUE_HIDES_GATING.test(bm[2])) hidesGating.push(name)
         continue
       }
- // Neither a field line nor a bullet naming a field: recorded as an unparsed note (a warning) that
- // does not affect validity.
+ // Neither a field line nor a bullet naming a field. This USED TO BE a note that did not affect
+ // validity, and that single decision was the hole: the prompt promises a closed grammar ("EVERY line
+ // inside the block must be one of the listed fields... no prose lines, no bullets, no continuation
+ // lines, no notes"), while the parser accepted anything it failed to recognise and carried on. So a
+ // blocker only had to be written in a shape the line matcher did not know: `**P0**: x`,
+ // `note P0: x`, `(P0: x)`, `P0 (blocking): x` all landed here and the round converged as an
+ // approval. Naming those four shapes and matching them too would have been the same mistake a fifth
+ // time -- there is always another prefix. A line this parser cannot read is a line whose meaning is
+ // unknown, and an unknown line inside a verdict block is exactly what the contract says is refused.
       unparsed.push(L.trim())
       if (lastName) warnings.push('unparsed line after field ' + lastName)
+      if (!MARKER_LINE.test(L)) foreign.push(L.trim())
     }
     if (!fields.has('VERDICT')) return null
-    return { text: b, fields, unparsed, warnings, hidesGating }
+    return { text: b, fields, unparsed, warnings, hidesGating, foreign }
   }
  // Filter out TEMPLATE/PLACEHOLDER blocks -- the brief echoed back -- and then require exactly one
  // semantically valid block to remain. The test is semantic: the VERDICT value must match the
@@ -988,8 +1015,13 @@ function parseSentinel(text) {
  // code did not keep. Folding a BULLET that names a field stays as it was: that path captures the
  // blocker into its own field, so nothing is lost. What is refused is the case where the blocker is
  // reachable only by reading a value the gates never consult.
-  const hidesGatingField = blockShape ? blockShape.hidesGating.length > 0 : false
-  const validBase = !!verdict && p0Raw !== null && claimFieldsOk && codeFieldsOk && evidenceOk && !placeholderInBlock && !hidesGatingField
+ // A value naming P0 matters only when P0 itself is a non-answer: with a real blocker already
+ // recorded, another mention of it is commentary, not something being lost.
+  const p0IsNonAnswer = !p0Raw || p0.length === 0 || p0.every(x => isStructuralNonAnswer(String(x)))
+  const hidesGatingField = blockShape ? (blockShape.hidesGating.length > 0 && p0IsNonAnswer) : false
+ // A line inside the block that is neither a field, a fold, a blank nor a machine marker.
+  const foreignLine = blockShape ? blockShape.foreign.length > 0 : false
+  const validBase = !!verdict && p0Raw !== null && claimFieldsOk && codeFieldsOk && evidenceOk && !placeholderInBlock && !hidesGatingField && !foreignLine
  // (approves is finalized after every field has been read — see approvesFinal below)
  // DELTA captured SAME-LINE only ([^\n\r]*, not lineVal's \s* which would greedily grab the NEXT line on
  // an empty "DELTA:" value and fail-OPEN the anti-false-convergence gate). Scoped fix; lineVal unchanged.

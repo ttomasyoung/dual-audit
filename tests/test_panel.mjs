@@ -41,6 +41,17 @@ const CLAUDE_APPROVE = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: ran regression 462
 const CLAUDE_HIDDEN_P0 = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: read 3 files line 12<br>P0: the delete path removes user data\nVERIFIED: pass\nEND'
 // The same shape with a NON-gating field name in the value: ordinary prose, and it must still converge.
 const CLAUDE_BENIGN_REF = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: read 3 files line 12\nVERIFIED: pass\nRECOMMEND: see EVIDENCE: above\nEND'
+// A line the parser cannot read at all. Every prefix shape a blocker can be dressed in — `**P0**:`,
+// `note P0:`, `(P0:)`, `P0 (blocking):` — arrives here, so this is one case standing for a class that
+// has no end: naming the shapes one at a time is how the previous four fixes were wrong.
+const CLAUDE_FOREIGN_LINE = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: read 3 files line 12\nVERIFIED: pass\n**P0**: the delete path removes user data\nEND'
+// The wrapper injects its exit-code marker INSIDE the block. If a foreign line invalidated without
+// exempting it, every verdict the wrapper ever produced would be refused.
+const cxMarker = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: static/import ok, 3 modules\nVERIFIED: pass\nAUDIT-ID: ${id}\n__DUAL_AUDIT_RC=0\nEND`
+// A full-width colon reads as a colon to the reviewer that wrote it, but not to an ASCII pattern.
+const CLAUDE_WIDE_COLON = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: read 3 files\uFF1C br\uFF1EP0\uFF1A the delete path removes user data\nVERIFIED: pass\nEND'
+// A value naming VERIFIED, with a real P0 recorded: prose about the fields, which must NOT be refused.
+const CLAUDE_TALKS_ABOUT = 'VERDICT: REJECT\nP0: the delete path removes user data at line 44\nEVIDENCE: read 3 files line 12\nVERIFIED: fail\nRECOMMEND: an honest VERIFIED: fail beats a guess\nEND'
 const CLAUDE_CLEAN_R = 'VERDICT: REJECT\nP0: none\nEVIDENCE: reviewed line 5 structure ok\nVERIFIED: pass\nEND'  // clean fixture: only the consensus gate can block it
 const cxApprove      = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: static/import ok, 3 modules\nVERIFIED: pass\nAUDIT-ID: ${id}\nEND`
 const cxApproveDelta = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: re-ran, fix line 90\nVERIFIED: pass\nDELTA: re-verified line 90 now passes\nAUDIT-ID: ${id}\nEND`
@@ -89,6 +100,9 @@ const FP = R1.task_fingerprint, A1 = FP + '_r1', A2 = FP + '_r2'
 const R2ok = { ...BSRC, prior_state: R1.prior_state, codex_prev_verdict_raw: cxApprove(A1), codex_exit_code: 0 }
 const R1hid = (await runPanel(BSRC, async () => CLAUDE_HIDDEN_P0)).r
 const R1ben = (await runPanel(BSRC, async () => CLAUDE_BENIGN_REF)).r
+const R1for = (await runPanel(BSRC, async () => CLAUDE_FOREIGN_LINE)).r
+const R1wid = (await runPanel(BSRC, async () => CLAUDE_WIDE_COLON)).r
+const R1tlk = (await runPanel(BSRC, async () => CLAUDE_TALKS_ABOUT)).r
 // Round-2 prior state: round 1 had Claude approving and the reviewer rejecting, so round 2 opens.
 const ps2 = (await runPanel(R2ok.prior_state ? { ...BSRC, prior_state: R1.prior_state, codex_prev_verdict_raw: cxCleanReject(A1), codex_exit_code: 0 } : BSRC, async () => CLAUDE_APPROVE)).r.prior_state
 // Baseline where the Claude side returns a clean REJECT.
@@ -188,6 +202,26 @@ const CASES_B = [
   { n: 'B26 a value naming a non-gating field still converges',
     args: { ...BSRC, prior_state: R1ben.prior_state, codex_prev_verdict_raw: cxApprove(R1ben.task_fingerprint + '_r1'), codex_exit_code: 0 },
     fn: () => CLAUDE_BENIGN_REF, ok: r => r.converged === true && r.convergence_status === 'converged' },
+  // B27: the closed grammar the prompt promises. A line this parser cannot read has unknown meaning,
+  // and an unknown line inside a verdict block is what the contract says is refused. Measured against
+  // 76 real verdicts before shipping: none of them contained one, so this costs nothing in practice.
+  { n: 'B27 an unreadable line inside the block cannot converge',
+    args: { ...BSRC, prior_state: R1for.prior_state, codex_prev_verdict_raw: cxApprove(R1for.task_fingerprint + '_r1'), codex_exit_code: 0 },
+    fn: () => CLAUDE_FOREIGN_LINE, ok: r => r.converged === false,
+    g: ' && !foreignLine', gf: '' },
+  // B28: the good case for B27 — the wrapper's own marker line must survive it.
+  { n: 'B28 the exit-code marker inside the block is not a foreign line',
+    args: { ...BSRC, prior_state: R1.prior_state, codex_prev_verdict_raw: cxMarker(A1), codex_exit_code: 0 },
+    fn: () => CLAUDE_APPROVE, ok: conv },
+  // B29: a colon variant is still a colon to whoever wrote it.
+  { n: 'B29 a blocker hidden behind a full-width colon cannot converge',
+    args: { ...BSRC, prior_state: R1wid.prior_state, codex_prev_verdict_raw: cxApprove(R1wid.task_fingerprint + '_r1'), codex_exit_code: 0 },
+    fn: () => CLAUDE_WIDE_COLON, ok: r => r.converged === false },
+  // B30: the good case for B25/B29. Reviewers discuss these fields in prose constantly; an earlier
+  // version of the rule refused 15 of 76 real verdicts for exactly this.
+  { n: 'B30 prose naming a field, with a real blocker recorded, is not refused',
+    args: { ...BSRC, prior_state: R1tlk.prior_state, codex_prev_verdict_raw: cxCleanReject(R1tlk.task_fingerprint + '_r1'), codex_exit_code: 0 },
+    fn: () => CLAUDE_TALKS_ABOUT, ok: r => r.convergence_status !== 'prior_state_schema_invalid' },
   // ==== ⑤ claim fixtures + ⑥ claim gate ====
   { n: 'B23 claim mode converges on a clean anchored round', args: { ...B_BIO, prior_state: R1bio.prior_state, codex_prev_verdict_raw: cxClaimA(R1bio.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAIM_A, ok: r => r.converged === true && r.convergence_status === 'converged' && (r.blockers || []).length === 0 && r.needs_expert_signoff === false },
   // B24: a Claude verdict whose ANCHOR is not "anchored" must be blocked by the claim gate.
