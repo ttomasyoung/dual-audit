@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# dual-audit:package-file (installed by dual-audit; ownership marker — do not remove)
+# dual-audit — command-line entry point for the installed toolkit.
+#
+#   dual-audit doctor          check the installation and the profile
+#   dual-audit profile apply   recompile the profile into the installed panel
+#   dual-audit profile path    print the profile path
+#   dual-audit profile show    print the compiled profile as JSON
+#   dual-audit profile routing print the MERGED routing table the controller routes on
+#   dual-audit paths           list every file this package owns
+#   dual-audit version         print the installed version
+#
+# doctor exits 0 when everything is usable, 1 when something is wrong. It never "fixes"
+# anything silently.
+set -uo pipefail
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+BIN_DIR="${DUAL_AUDIT_BIN_DIR:-$HOME/.local/bin}"
+SHARE_DIR="${DUAL_AUDIT_SHARE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/dual-audit}"
+CONFIG_DIR="${DUAL_AUDIT_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/dual-audit}"
+PROFILE="$CONFIG_DIR/profile.yaml"
+MANIFEST="$SHARE_DIR/manifest.json"
+LIB="$SHARE_DIR/lib/profile.js"
+BASE_PROFILES="$SHARE_DIR/profiles"
+
+die() { echo "dual-audit: $*" >&2; exit 1; }
+
+manifest_field() { # manifest_field <key>
+  [ -r "$MANIFEST" ] || return 1
+  node -e '
+    const m=require(process.argv[1]);
+    const v=m[process.argv[2]];
+    if (v===undefined) process.exit(1);
+    console.log(typeof v==="string"?v:JSON.stringify(v));
+  ' "$MANIFEST" "$1" 2>/dev/null
+}
+
+panel_path() { manifest_field panel_path; }
+
+cmd_version() {
+  local v; v="$(manifest_field version)" || die "no installation manifest at $MANIFEST — run install.sh"
+  echo "dual-audit $v"
+}
+
+cmd_paths() {
+  [ -r "$MANIFEST" ] || die "no installation manifest at $MANIFEST — run install.sh"
+  node -e '
+    const m=require(process.argv[1]);
+    for (const f of m.files) console.log(f.path);
+    console.log(process.argv[2] + "   (yours, never overwritten)");
+  ' "$MANIFEST" "$PROFILE"
+}
+
+cmd_profile() {
+  case "${1:-}" in
+    path) echo "$PROFILE" ;;
+    show) [ -r "$PROFILE" ] || die "no profile at $PROFILE"
+          node "$LIB" show "$PROFILE" "$BASE_PROFILES" ;;
+    # The routing table the controller actually routes on. It is NOT part of `show`, because `show`
+    # prints what is compiled into the panel and routing deliberately is not — the panel reviews,
+    # the controller routes. It is also normally inherited from the base profile, so reading the
+    # user's own file directly shows nothing and the documented keys look missing.
+    routing) [ -r "$PROFILE" ] || die "no profile at $PROFILE"
+          node "$LIB" routing "$PROFILE" "$BASE_PROFILES" ;;
+    apply)
+      [ -r "$PROFILE" ] || die "no profile at $PROFILE"
+      local p; p="$(panel_path)" || die "no installation manifest at $MANIFEST — run install.sh"
+      node "$LIB" compile "$PROFILE" "$p" "$BASE_PROFILES" || exit 1
+      ;;
+    *) die "usage: dual-audit profile apply|path|show|routing" ;;
+  esac
+}
+
+cmd_doctor() {
+  local problems=0 notes=0
+  say_ok()   { echo "  ok     $*"; }
+  say_warn() { echo "  note   $*"; notes=$((notes+1)); }
+  say_bad()  { echo "  PROBLEM $*"; problems=$((problems+1)); }
+
+  echo "dual-audit doctor"
+  echo ""
+  echo "Runtime dependencies:"
+  if command -v node >/dev/null 2>&1; then say_ok "node $(node --version)"; else say_bad "node not found — the panel and driver are Node workflows"; fi
+  if command -v bash >/dev/null 2>&1; then say_ok "bash $(bash --version | head -1 | sed 's/.*version //;s/ .*//')"; else say_bad "bash not found"; fi
+  for u in flock mktemp timeout awk sed grep find; do
+    command -v "$u" >/dev/null 2>&1 || say_bad "missing required utility: $u"
+  done
+  if command -v codex >/dev/null 2>&1 || [ -x "${DUAL_AUDIT_CODEX_BIN:-$HOME/.local/bin/codex}" ]; then
+    say_ok "codex CLI found"
+  else
+    say_bad "codex CLI not found — the second reviewer cannot run. Install it, or set DUAL_AUDIT_CODEX_BIN."
+  fi
+  if command -v claude >/dev/null 2>&1; then say_ok "claude CLI found"; else say_warn "claude CLI not on PATH (only needed if you drive audits from the CLI)"; fi
+
+  echo ""
+  echo "Installation:"
+  if [ -r "$MANIFEST" ]; then
+    # Parsed on its own FIRST, where a failure is visible. The integrity check below redirects
+    # stderr, so a malformed manifest produced no output there, an empty result read as "no
+    # findings", and doctor reported every file present and unmodified without having looked at
+    # one. An unreadable ownership record is the strongest reason to fail, not a reason to pass.
+    if ! node -e 'const m=require(process.argv[1]); if(m.package!=="dual-audit"||!Array.isArray(m.files)||typeof m.version!=="string") process.exit(1)' "$MANIFEST" 2>/dev/null; then
+      say_bad "manifest at $MANIFEST is unreadable or malformed — nothing about this installation can be verified; reinstall"
+    else
+    say_ok "manifest $MANIFEST (version $(manifest_field version))"
+    local bad
+    bad="$(node -e '
+      const fs=require("fs"), crypto=require("crypto");
+      const m=require(process.argv[1]);
+      // A "mutable" file is not unchecked. Its whole-file hash may differ because `profile apply`
+      // rewrites the generated block; everything OUTSIDE that block must still match base_sha256.
+      // Skipping it entirely meant the panel — the one file an attacker or an accident would most
+      // want to change — was never verified, while the summary line still said "unmodified".
+      let lib=null;
+      try { lib=require(process.argv[2]) } catch (e) { lib=null }
+      const baseSha = lib ? lib.baseSha : null;
+      // Computed from code, never read from the manifest: a manifest is a file, and a file can
+      // claim to own anything. An entry outside this set is reported rather than verified, because
+      // "this path checks out" about a path we never install is a meaningless reassurance.
+      const allowed = lib ? new Set(lib.installTargets({
+        claudeDir: process.argv[3], binDir: process.argv[4], shareDir: process.argv[5],
+      }).map(t => t.dst)) : null;
+      let out=[];
+      // Every file this package installs must be CLAIMED by the manifest. Iterating the manifest alone
+      // meant its length decided how much got verified: `files: []` produced an empty finding list,
+      // which read as "no problems", and doctor printed "all installed files present" and exited 0
+      // having checked nothing at all. Coverage is computed from code, so shortening the manifest can
+      // no longer shorten the check.
+      if (allowed) {
+        const claimed=new Set(m.files.map(f => f && f.path));
+        for (const t of allowed) if (!claimed.has(t)) out.push("manifest does not cover a file this package installs: "+t);
+      }
+      for (const f of m.files) {
+        // A malformed entry is a finding, not a crash. It used to throw here, and because this program
+        // runs with stderr discarded, the crash produced empty output that read as "no findings".
+        if (!f || typeof f.path !== "string") { out.push("malformed manifest entry (no path): "+JSON.stringify(f)); continue; }
+        if (!allowed) { out.push("cannot verify (profile library unreadable): "+f.path); continue; }
+        if (!allowed.has(f.path)) { out.push("manifest claims a path this package does not install: "+f.path); continue; }
+        // lstat, not existsSync: existsSync follows a symlink, so a package file replaced by a link
+        // to something else reported as present and — if the link resolved to identical bytes —
+        // unmodified. An installed file is a regular file; anything else is a finding.
+        let st=null; try { st=fs.lstatSync(f.path) } catch (e) { st=null }
+        if (!st) { out.push("missing: "+f.path); continue; }
+        if (!st.isFile()) { out.push("not a regular file (symlink or other): "+f.path); continue; }
+        // The file must prove it is ours from its own contents; a manifest cannot confer ownership.
+        try { if (!fs.readFileSync(f.path,"utf8").includes(process.argv[6])) { out.push("does not carry this package'"'"'s ownership marker: "+f.path); continue; } }
+        catch (e) { out.push("unreadable: "+f.path); continue; }
+        const h=crypto.createHash("sha256").update(fs.readFileSync(f.path)).digest("hex");
+        if (h===f.sha256) continue;
+        if (f.mutable && typeof f.base_sha256==="string") {
+          if (!baseSha) { out.push("cannot verify (profile library unreadable): "+f.path); continue; }
+          let ok=false; try { ok = baseSha(f.path)===f.base_sha256 } catch (e) { ok=false }
+          if (ok) continue;
+          out.push("modified outside the generated profile block: "+f.path); continue;
+        }
+        out.push("modified since install: "+f.path);
+      }
+      console.log(out.join("\n"));
+    ' "$MANIFEST" "$LIB" "$CLAUDE_DIR" "$BIN_DIR" "$SHARE_DIR" 'dual-audit:package-file' 2>/dev/null)"
+    local irc=$?
+    if [ "$irc" -ne 0 ]; then
+      # The check itself died. With stderr discarded, a crash and a clean run with nothing to report
+      # produce exactly the same empty string — so without this the strongest possible signal that
+      # the installation cannot be trusted was rendered as "all installed files present".
+      say_bad "the integrity check could not run to completion (exit $irc) — nothing about this installation was verified; reinstall"
+    elif [ -n "$bad" ]; then
+      # say_bad, not say_warn: a missing or altered installed file is an integrity failure, and
+      # doctor's exit code is what a script checks. Reported as a note, it printed the problem and
+      # still exited 0 — the caller saw a pass.
+      while IFS= read -r line; do [ -n "$line" ] && say_bad "$line"; done <<< "$bad"
+    else
+      say_ok "all installed files present; every byte outside the generated profile block still matches the manifest"
+    fi
+    fi
+  else
+    say_bad "no manifest at $MANIFEST — run install.sh"
+  fi
+
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) say_ok "~/.local/bin is on PATH" ;;
+    *) say_bad "~/.local/bin is NOT on PATH — the reviewer wrapper will not be found. Add: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  esac
+
+  echo ""
+  echo "Profile:"
+  if [ -r "$PROFILE" ]; then
+    local out rc
+    out="$(node "$LIB" check "$PROFILE" "$BASE_PROFILES" 2>&1)"; rc=$?
+    while IFS= read -r line; do
+      case "$line" in
+        ERROR*) say_bad "${line#ERROR }" ;;
+        WARN*)  say_warn "${line#WARN }" ;;
+        NOTE*)  say_warn "${line#NOTE }" ;;
+        OK*)    say_ok "${line#OK }" ;;
+        *)      [ -n "$line" ] && echo "  $line" ;;
+      esac
+    done <<< "$out"
+    [ "$rc" -ne 0 ] && problems=$((problems+1))
+
+    local p live installed
+    if p="$(panel_path)" && [ -r "$p" ]; then
+      installed="$(node "$LIB" installed-sha "$p" 2>/dev/null)"
+      live="$(node -e 'const c=require("crypto"),f=require("fs");console.log(c.createHash("sha256").update(f.readFileSync(process.argv[1])).digest("hex"))' "$PROFILE")"
+      if [ "$installed" = "MISSING" ]; then
+        say_bad "PROFILE_BLOCK_MISSING: the installed panel has no generated profile block — reinstall"
+      elif [ "$installed" != "$live" ]; then
+        say_bad "PROFILE_STALE: $PROFILE changed since it was compiled — run: dual-audit profile apply"
+      else
+        say_ok "the compiled profile in the panel matches $PROFILE"
+      fi
+    else
+      # No else branch here meant the staleness check was skipped in silence whenever the manifest
+      # carried no panel_path or the panel could not be read — the two situations in which the
+      # compiled profile is LEAST likely to be trustworthy. Skipping a check is a finding.
+      say_bad "cannot locate or read the installed panel (manifest has no usable panel_path, or the file is unreadable) — the compiled profile could not be checked at all"
+    fi
+  else
+    say_bad "no profile at $PROFILE — run install.sh, or copy profiles/user.example.yaml there"
+  fi
+
+  echo ""
+  if [ "$problems" -gt 0 ]; then
+    echo "RESULT: $problems problem(s), $notes note(s) — fix the problems above before relying on a review."
+    return 1
+  fi
+  echo "RESULT: no problems, $notes note(s)."
+  return 0
+}
+
+case "${1:-}" in
+  doctor)  shift; cmd_doctor "$@" ;;
+  profile) shift; cmd_profile "$@" ;;
+  paths)   cmd_paths ;;
+  version|--version|-v) cmd_version ;;
+  ""|help|--help|-h)
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command: $1 (try: dual-audit help)" ;;
+esac

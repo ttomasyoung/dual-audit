@@ -1,0 +1,665 @@
+#!/bin/bash
+# dual-audit:package-file (installed by dual-audit; ownership marker — do not remove)
+# dual-audit-codex — hardened, read-only Codex wrapper for the dual-audit panel.
+#
+# WHY THIS EXISTS: several review sessions can run on one machine at the same time.
+# Writing a brief to a fixed path and then running `codex exec` on it lets a second
+# session overwrite the file between write and read, so a reviewer silently audits the
+# WRONG task. This wrapper gives every run a private CODEX_HOME, a private working
+# directory, a unique early snapshot of the brief taken from stdin, and a bounded slot
+# semaphore, so concurrent runs cannot collide.
+#
+# USAGE (the brief MUST arrive on stdin; a bare `codex exec` with a fixed brief path is
+# exactly the failure mode above):
+#   dual-audit-codex exec --sandbox read-only --skip-git-repo-check --emit-rc - < brief.md
+#
+#   Pre-batch admission gate (runs no reviewer, needs no stdin; 0 = safe to dispatch,
+#   98 = refuse):
+#   dual-audit-codex --preflight
+#
+#   Inside a batch add --batch (or DUAL_AUDIT_BATCH=1): when the token is close to
+#   expiry it returns 98 instead of downgrading to serial mode, so the scheduler stops
+#   adding work rather than stampeding the serial lock.
+#
+# EXIT CODES
+#   99  no slot or lock available. (The reviewer itself can also return 99; the wrapper
+#       cannot distinguish the two and records rc99_unattributed in telemetry.)
+#   98  token admission failed (--preflight / --batch).
+#   124, 137  timed out OR the child was killed. These are TIMEOUT-LIKE, not proof of a
+#       timeout: the reviewer can return 124 itself, and 137 also comes from the OOM
+#       killer or an external SIGKILL.
+#   9   stdin was an empty TTY.  8  bad argument or a failed path guard.  7  cd failed.
+#   3-6 bootstrap failure.  Anything else is the reviewer's own exit code, passed through.
+#
+# ENVIRONMENT (all optional)
+#   DUAL_AUDIT_TIMEOUT (540, <=86400)      DUAL_AUDIT_KILL_AFTER (30, <=3600)
+#   DUAL_AUDIT_MAX_PAR (8; >32 clamps to 32)  DUAL_AUDIT_LOCK_WAIT (540, <=7200)
+#   DUAL_AUDIT_EXP_MARGIN (900, <=604800)  DUAL_AUDIT_STDIN_TIMEOUT (120, <=3600)
+#   DUAL_AUDIT_MODE (isolated|serial)      DUAL_AUDIT_BATCH (0|1)
+#   DUAL_AUDIT_CODEX_BIN, DUAL_AUDIT_RUNTIME_DIR, DUAL_AUDIT_STATE_DIR
+#   DUAL_AUDIT_TELEMETRY  absolute path to a JSONL file. UNSET = telemetry OFF, which is
+#       the default. Telemetry records timing, waiting, mode and an exit category only —
+#       never a brief, argv, path, environment value, or anything derived from the token.
+#   Except for MAX_PAR clamping, a value over the ceiling or in a malformed numeric form
+#   exits 8 rather than silently falling back to the default.
+#
+# ISOLATION MODEL (default "isolated"): a fresh CODEX_HOME, an empty HOME, a neutral
+# working directory and a unique brief snapshot per run; access-token-only credentials
+# with the refresh token removed; no exec, so the cleanup trap always runs; automatic
+# downgrade to serial mode when the token is close to expiry.
+#
+# HOW TO ABORT A RUNNING REVIEW (counter-intuitive, so it is written down):
+#   * kill -TERM <wrapper>  does NOT stop it promptly. Bash defers the trap until the
+#     foreground child finishes, so the wrapper exits only once the reviewer does.
+#   * kill -TERM <the timeout child>  stops it immediately and cleans up. But the
+#     reviewer often exits gracefully on TERM and returns 0, so an ABORTED review can
+#     look like a successful one. The wrapper faithfully reports the child's status and
+#     cannot tell the difference; whoever sends the signal must account for it.
+#   * kill -9 <wrapper>  leaves the reviewer orphaned and the private home uncleaned.
+#
+# KNOWN BOUNDARIES this wrapper cannot fix: someone calling the reviewer directly rather
+# than through here (rules and dual-audit-lint cover that); a caller redirecting stdout
+# to a shared fixed file; the narrow window where serial mode and an interactive session
+# rotate credentials simultaneously; and the fact that only HOME and CODEX_HOME are
+# overridden in the child environment.
+set -u
+umask 077
+
+# ---- Installation-neutral locations ---------------------------------------
+# Runtime scratch: locks, the slot semaphore, and one private home per run. The
+# directory is PER-UID and ownership-checked, so another account cannot pre-create
+# our lock as a FIFO or a symlink and wedge every audit on this machine.
+RUNTIME_DIR="${DUAL_AUDIT_RUNTIME_DIR-/tmp/dual-audit-$(id -u)}"
+case "$RUNTIME_DIR" in
+  /*) ;;
+  *) echo "dual-audit-codex: DUAL_AUDIT_RUNTIME_DIR must be an absolute path" >&2; exit 8 ;;
+esac
+mkdir -p "$RUNTIME_DIR" 2>/dev/null || { echo "dual-audit-codex: cannot create runtime dir $RUNTIME_DIR" >&2; exit 5; }
+chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+[ -L "$RUNTIME_DIR" ] && { echo "dual-audit-codex: $RUNTIME_DIR is a symlink; refusing to run" >&2; exit 8; }
+[ -O "$RUNTIME_DIR" ] || { echo "dual-audit-codex: $RUNTIME_DIR is not owned by this user; refusing to run" >&2; exit 8; }
+
+# Long-lived state: only the serial-mode private CODEX_HOME lives here.
+STATE_DIR="${DUAL_AUDIT_STATE_DIR-${XDG_STATE_HOME:-$HOME/.local/state}/dual-audit}"
+
+# The real Codex CLI: explicit override first, then PATH, then the usual location.
+REAL_CODEX="${DUAL_AUDIT_CODEX_BIN-}"
+if [ -z "$REAL_CODEX" ]; then REAL_CODEX="$(command -v codex 2>/dev/null || true)"; fi
+[ -n "$REAL_CODEX" ] || REAL_CODEX="$HOME/.local/bin/codex"
+SRC_AUTH="$HOME/.codex/auth.json"; [ -f "$SRC_AUTH" ] || SRC_AUTH="$HOME/.codex-cli/auth.json"   # one source for both modes
+# Cap the credential file size, so a malformed huge file cannot pin CPU or memory
+if [ -f "$SRC_AUTH" ]; then _sz=$(stat -c%s "$SRC_AUTH" 2>/dev/null || echo 0); [ "$_sz" -gt 1048576 ] && { echo "dual-audit-codex: $SRC_AUTH is unexpectedly large (>1MB); refusing to run" >&2; exit 3; }; fi
+AUDIT_HOME="$STATE_DIR/serial-codex-home"
+LOCK="${RUNTIME_DIR}/.dual-audit.lock"
+SLOT_DIR="${RUNTIME_DIR}/.dual-audit-slots"
+MODE="${DUAL_AUDIT_MODE-isolated}"   # Uses ${x-} not ${x:-}: an explicitly EMPTY value counts as "explicitly set" and must be refused
+# MODE must be allowlisted: it is written verbatim into the telemetry "mode" field, so
+#   an unvalidated value can inject JSON fields, and with a newline it can forge an
+#   entire record. It also fixes an older problem: any non-serial value used to be
+#   treated silently as isolated, so a typo never surfaced.
+case "$MODE" in isolated|serial) ;;
+  *) printf 'dual-audit-codex: DUAL_AUDIT_MODE accepts only isolated|serial (got %q); refusing to run\n' "$MODE" >&2; exit 8 ;; esac
+PREFLIGHT=0                                   # --preflight: check token freshness only, never run the reviewer (pre-batch admission)
+EMIT_RC=0                                     # --emit-rc: inject the real exit code INSIDE the VERDICT..END block (see the exec section below)
+BATCH="${DUAL_AUDIT_BATCH-0}"                # Uses ${x-0} not ${x:-0}: the latter treats an explicitly empty value as unset and silently turns
+# the batch switch OFF, which is a safety switch failing open
+# A safety switch accepts only 0 or 1: a malformed value must refuse to run rather than fail open to "off"
+case "$BATCH" in 0) BATCH=0 ;; 1) BATCH=1 ;;
+  *) echo "dual-audit-codex: DUAL_AUDIT_BATCH accepts only 0 or 1 (got '$BATCH'); refusing to run" >&2; exit 8 ;; esac
+
+# ==== Numeric environment-variable contract ====
+#   unset                                   -> use the default
+#   set but not a canonical positive integer -> exit 8 (never fall back to the default)
+#   valid but above the ceiling             -> exit 8, except MAX which clamps down to 32
+# Why silently falling back to the default is a DEFECT: LOCK_WAIT=07000 would silently
+#   become 540, lowering the admission threshold the user intended to raise, and
+#   MAX_PAR=01 would silently become the default 8 and INCREASE concurrency. In both
+#   cases malformed input buys looser runtime parameters.
+# Leading zeros are refused because bash arithmetic reads 060000 as octal, which makes
+#   the threshold silently smaller than the number the user wrote.
+_posint(){ case "${1:-}" in ''|*[!0-9]*|0*) return 1;; *) [ "$1" -gt 0 ];; esac; }
+# Must write back to a global rather than echo into a command substitution: `exit` inside $( ) leaves only the subshell, so the refusal would be swallowed
+_numenv(){   # $1=shell var name $2=env var name $3=default $4=ceiling (empty=none) $5=clamp (1=clamp instead of refuse)
+  local _n="$1" _e="$2" _d="$3" _c="${4:-}" _clamp="${5:-}" _v
+  # Use [[ -v ]] to test "is it set", never a string sentinel: any sentinel can be
+  #   supplied from the environment, so a caller could disguise a set variable as unset
+  #   and get the silent default this contract exists to prevent.
+  if [[ -v $_e ]]; then
+    _v=${!_e}
+    _posint "$_v" || { printf 'dual-audit-codex: %s=%q is not a canonical positive decimal integer (no empty, 0, leading zeros, negatives, non-digits, or values outside the shell integer range); refusing to run\n' "$_e" "$_v" >&2; exit 8; }
+  else
+    _v=$_d
+  fi
+  if [ -n "$_c" ] && [ "$_v" -gt "$_c" ]; then
+    if [ "$_clamp" = 1 ]; then
+      printf 'dual-audit-codex: %s=%s exceeds the ceiling %s; clamped to %s (less concurrency, the safe direction)\n' "$_e" "$_v" "$_c" "$_c" >&2
+      _v="$_c"
+    else printf 'dual-audit-codex: %s=%s exceeds the supported ceiling %s; refusing to run rather than clamping silently\n' "$_e" "$_v" "$_c" >&2; exit 8; fi
+  fi
+  printf -v "$_n" '%s' "$_v"
+}
+# These two defaults are sized to FIT INSIDE THE CALLER'S CEILING, not to be generous.
+#
+# The reviewer is invoked by an agent that runs this wrapper as a single shell command, and that
+# command is cut off by the controller after 600s. A budget larger than the ceiling cannot be spent:
+# the command is taken away at 600s and the agent is left holding nothing, so the panel receives an
+# empty verdict. It reports that honestly — an empty reviewer is INFRASTRUCTURE_BLOCKED, never an
+# approval — but "the reviewer produced nothing" is exactly what a dead reviewer looks like, and the
+# user is given no way to tell a review that ran out of room from a Codex that is down.
+#
+# Observed: a 900s default with a 600s ceiling. A real review of two shell scripts took 456s, so the
+# common case fit and the failure only appeared on the longer ones — the worst shape for a default,
+# because it works until the review matters. At 540 an over-long review is killed by THIS wrapper,
+# which exits 124 and says so; a slot that never frees exits 99 within the ceiling instead of being
+# cut off at 600s with no message. A caller with no such ceiling can raise both by environment.
+_numenv TIMEOUT       DUAL_AUDIT_TIMEOUT       540   86400
+# KILL_AFTER is the grace period AFTER a timeout, and is deliberately excluded from the
+# token threshold: the threshold covers the normal execution window, and promises nothing
+# about the token still being valid during a forced kill.
+_numenv KILL_AFTER    DUAL_AUDIT_KILL_AFTER    30    3600
+_numenv MAX           DUAL_AUDIT_MAX_PAR       8     32     1     # MAX is clamped when too large (less concurrency is the safe direction); malformed values still refuse
+_numenv LOCK_WAIT     DUAL_AUDIT_LOCK_WAIT     540   7200         # also feeds the admission threshold, on the same basis as TIMEOUT and EXP_MARGIN
+_numenv EXP_MARGIN    DUAL_AUDIT_EXP_MARGIN    900   604800
+_numenv STDIN_TIMEOUT DUAL_AUDIT_STDIN_TIMEOUT 120   3600
+
+# Argument guard: consume --serial; refuse -C/--cd in every form (it would let the reviewer chdir back into a directory whose configuration we deliberately escaped), without touching the lowercase -c/--config
+ARGS=()
+SANDBOX_OK=0        # a `--sandbox read-only` was seen, in either spelling
+WANT_SANDBOX_VAL=0  # the previous argument was a bare `--sandbox`, so this one is its value
+for a in "$@"; do
+  if [ "$WANT_SANDBOX_VAL" = 1 ]; then
+    WANT_SANDBOX_VAL=0
+    [ "$a" = read-only ] || { echo "dual-audit-codex: --sandbox $a is not allowed; this wrapper only runs reviews read-only" >&2; exit 8; }
+    SANDBOX_OK=1; ARGS+=("$a"); continue
+  fi
+  case "$a" in
+    --serial) MODE=serial ;;
+    --preflight) PREFLIGHT=1 ;;
+    --batch) BATCH=1 ;;
+    --emit-rc) EMIT_RC=1 ;;
+    -C*|--cd*) echo "dual-audit-codex: -C/--cd is not allowed (including the attached forms -C/path and -C=path); refusing to run" >&2; exit 8 ;;
+    # Read-only is the property this wrapper exists to guarantee, so it is CHECKED here rather than
+    # left to whoever wrote the command line. Passing the sandbox mode straight through meant the
+    # documented guarantee held only for callers who already intended to honour it — which is not a
+    # guarantee, and the reviewer that most needs to be contained is the one invoked wrongly.
+    --sandbox=*)
+      [ "${a#--sandbox=}" = read-only ] || { echo "dual-audit-codex: ${a} is not allowed; this wrapper only runs reviews read-only" >&2; exit 8; }
+      SANDBOX_OK=1; ARGS+=("$a") ;;
+    --sandbox) WANT_SANDBOX_VAL=1; ARGS+=("$a") ;;
+    --dangerously-bypass-approvals-and-sandbox|--full-auto|--yolo)
+      echo "dual-audit-codex: $a removes the sandbox; refusing to run" >&2; exit 8 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+[ "$WANT_SANDBOX_VAL" = 1 ] && { echo "dual-audit-codex: --sandbox was given with no value; refusing to run" >&2; exit 8; }
+set -- ${ARGS+"${ARGS[@]}"}
+
+# ---- --batch and serial mode are mutually exclusive: the serial branch runs and exits
+#      BEFORE the in-batch token check, so combining them bypasses batch admission
+#      entirely. Batch exists precisely to avoid the serial path, so the combination is
+#      meaningless as well as dangerous -> refuse.
+if [ "$BATCH" = 1 ] && [ "$MODE" = serial ]; then
+  echo "dual-audit-codex: --batch and serial mode are mutually exclusive: batch exists precisely to avoid serial fallback, and combining them bypasses in-batch admission; refusing to run" >&2; exit 8
+fi
+# ---- --preflight and an exec payload are mutually exclusive: otherwise a command that
+#   carries both takes the preflight branch, silently discards the whole exec request and
+#   returns 0, so the caller believes a review ran when nothing was reviewed. Same class
+#   of false-success channel as an aborted run reporting 0 -> fail closed.
+if [ "$PREFLIGHT" = 1 ] && [ "${#ARGS[@]}" -gt 0 ]; then
+  printf 'dual-audit-codex: --preflight is pre-batch admission only and cannot be combined with an exec request (extra arguments: %s); refusing to run\n' "${ARGS[*]}" >&2
+  exit 8
+fi
+# ---- A review must be requested read-only, explicitly. Omitting the flag leaves the mode to the
+#   real CLI's own default, which is not a promise this wrapper can make on the caller's behalf —
+#   and "read-only unless someone forgot" is exactly the guarantee the documentation does NOT make.
+if [ "$PREFLIGHT" != 1 ] && [ "${#ARGS[@]}" -gt 0 ] && [ "$SANDBOX_OK" != 1 ]; then
+  echo "dual-audit-codex: a review must be requested with --sandbox read-only; refusing to run" >&2
+  exit 8
+fi
+
+# ---- Remaining token lifetime in seconds; -1 when it cannot be parsed. Shared by preflight and the post-slot check so the two cannot drift ----
+_token_remaining(){
+  local _r
+  _r=$(timeout 30 python3 - "$SRC_AUTH" <<'PY' 2>/dev/null
+import json,sys,base64,time
+try:
+    d=json.load(open(sys.argv[1])); tok=d.get("tokens",{}).get("access_token","") or ""
+    p=tok.split(".")[1]; p+="="*(-len(p)%4)
+    exp=json.loads(base64.urlsafe_b64decode(p)).get("exp")
+    print(int(exp-time.time()) if exp else -1)
+except Exception: print(-1)
+PY
+)
+  # Strict validation, fail closed. A loose test such as case ''|*[!0-9-]* admits '1-2',
+  #   '--1' and oversized integers; an oversized integer then makes [ -lt ] fail with
+  #   "integer expression expected" and return false, so NEITHER refusal branch is taken
+  #   and the run falls through to OK — fail open.
+  [[ "$_r" =~ ^-?[0-9]{1,10}$ ]] || _r=-1
+  printf '%s' "$_r"
+}
+
+# ==== Run-level telemetry ====
+# Purpose: answer only "is the concurrency cap high enough (queue-time distribution), how
+# often does the token gate fire, what is the exit-code mix, how often do runs downgrade
+# to serial".
+# NEVER written to disk: anything from the token or credentials (including remaining
+# seconds, which reveal when it was issued), the brief, argv, paths, environment values,
+# or fragments of stderr.
+#   Every string field is either an enum this script produced or is strictly allowlisted;
+#   a caller's raw string is never concatenated into the JSON, so log records cannot be
+#   forged with an embedded newline.
+# It deliberately does NOT live under the serial private CODEX_HOME: in serial mode that
+#   directory IS the reviewer's home and must stay separate from our own records.
+TM_FILE="${DUAL_AUDIT_TELEMETRY-}"
+TM_DIR=""; TM_LOCK=""; TM_ON=0
+TM_MAXBYTES=33554432                          # rotate at 32 MiB
+TM_RUN_ID=""; TM_BATCH_ID=""; TM_MODE="$MODE"
+TM_SLOT=""; TM_SLOT_WAIT_MS=0; TM_SERIAL_WAIT_MS=0; TM_EXEC_MS=0; TM_TOKEN=not_checked
+TM_EXEC_T0=""   # Global, not local: on a signal the timing line never runs, so _on_exit computes exec_ms instead
+TM_STARTED=0
+# batch_id is caller-controlled, so it is allowlisted; a non-matching value drops the field rather than refusing the run
+case "${DUAL_AUDIT_BATCH_ID-}" in
+  '') : ;;
+  *[!A-Za-z0-9_.-]*) : ;;
+  ?*) [ "${#DUAL_AUDIT_BATCH_ID}" -le 64 ] && TM_BATCH_ID="$DUAL_AUDIT_BATCH_ID" ;;
+esac
+# Durations use a MONOTONIC clock, not the wall clock: NTP stepping backwards would
+# otherwise produce negative durations. SECONDS is also unsuitable, because it is reset
+# for LOCK_WAIT semantics elsewhere in this script.
+_mono_ms(){ local _u _f; read -r _u _ < /proc/uptime 2>/dev/null || { printf 0; return; }
+            _f="${_u#*.}"; printf '%s' $(( ${_u%.*} * 1000 + 10#${_f}0 )); }
+_dur_ms(){ local _d=$(( $(_mono_ms) - ${1:-0} )); [ "$_d" -lt 0 ] && _d=0; printf '%s' "$_d"; }   # clamp negatives
+# The telemetry path MUST be absolute: `${TM_FILE%/*}` returns the WHOLE string when it
+#   contains no slash, so a relative value would create a DIRECTORY of that name in the
+#   caller's working directory. The wrapper also cd's into a private directory while it
+#   runs, so a relative path is meaningless anyway. A non-absolute value silently
+#   disables telemetry and never fails the review.
+case "$TM_FILE" in /*) : ;; ?*) TM_FILE="" ;; esac
+if [ -n "$TM_FILE" ]; then
+  TM_DIR="${TM_FILE%/*}"; TM_LOCK="$TM_DIR/telemetry.lock"
+  # Any telemetry problem silently DISABLES TELEMETRY and never refuses the review.
+  # The lock object needs a guard too: opening a FIFO with `exec 201>>` blocks FOREVER,
+  #   and flock's timeout does not protect the open itself, so the whole review would
+  #   hang before reaching any fallback. A FIFO, symlink, non-regular file or a file we
+  #   do not own therefore disables telemetry outright.
+  if [ -L "$TM_FILE" ] || [ -L "$TM_DIR" ] || [ -L "$TM_LOCK" ] || [ -p "$TM_LOCK" ]; then TM_ON=0
+  elif mkdir -p "$TM_DIR" 2>/dev/null && [ -O "$TM_DIR" ] \
+       && { [ ! -e "$TM_FILE" ] || { [ -f "$TM_FILE" ] && [ -O "$TM_FILE" ]; }; } \
+       && { [ ! -e "$TM_LOCK" ] || { [ -f "$TM_LOCK" ] && [ -O "$TM_LOCK" ]; }; }; then
+    TM_ON=1; TM_RUN_ID="$$-$(_mono_ms)-$RANDOM"
+  fi
+fi
+_tm_rotate(){ local _sz; _sz=$(stat -c%s "$TM_FILE" 2>/dev/null || echo 0)
+  [ "$_sz" -gt "$TM_MAXBYTES" ] && mv -f "$TM_FILE" "$TM_FILE.$(date -u +%Y%m%dT%H%M%SZ).$$" 2>/dev/null; : ; }
+# A run writes two or three lines. Rotation and append both happen inside the lock, so
+# the critical section is sub-millisecond.
+# Deliberate deviation from the obvious design: failing to take the lock does NOT drop the
+#   event; it falls back to a plain O_APPEND write. Losing an end record makes a healthy
+#   run look like an abnormal termination, which corrupts the very metric being measured,
+#   while O_APPEND at this line length is effectively atomic. The parser must tolerate a
+#   torn line, a duplicate, or an end without a start in any case.
+_tm(){   # $1=event, remaining arguments are pre-formed JSON fragments
+  [ "$TM_ON" = 1 ] || return 0
+  local _ev="$1"; shift
+  local _line="{\"v\":2,\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)\",\"event\":\"$_ev\",\"run_id\":\"$TM_RUN_ID\"$*}"
+  [ "${#_line}" -gt 2048 ] && return 0                                  # over-long lines are dropped rather than truncated into half a JSON record
+  { if exec 201>>"$TM_LOCK" 2>/dev/null && flock -w 0.25 201 2>/dev/null; then
+      _tm_rotate; printf '%s\n' "$_line" >> "$TM_FILE" 2>/dev/null; exec 201>&-
+    else exec 201>&- 2>/dev/null; printf '%s\n' "$_line" >> "$TM_FILE" 2>/dev/null; fi; } 2>/dev/null || :
+  return 0
+}
+_tm_common(){ printf ',"mode":"%s","slot":%s,"slot_wait_ms":%s,"serial_lock_wait_ms":%s,"exec_ms":%s,"timeout_s":%s,"token_status":"%s","batch":%s,"batch_id":%s,"http_signal":"unavailable"' \
+  "$TM_MODE" "${TM_SLOT:-null}" "$TM_SLOT_WAIT_MS" "$TM_SERIAL_WAIT_MS" "$TM_EXEC_MS" "$TIMEOUT" "$TM_TOKEN" "$BATCH" \
+  "$( [ -n "$TM_BATCH_ID" ] && printf '"%s"' "$TM_BATCH_ID" || printf null )"; }
+# Exit code -> category, using only enums this script produces. http_signal is always
+#   "unavailable" rather than "none": recording none would assert we looked and found
+#   nothing, and we never looked.
+# 124 and 137 are INFERRED, not asserted: the reviewer can return 124 itself, and 137 can
+#   come from the OOM killer or an external SIGKILL. Hence the name timeout_like, and
+#   timeout_s is recorded alongside. exec_ms >= timeout_s*1000 only shows the run is
+#   CONSISTENT with a timeout; a small exec_ms rules one out, but the converse does not
+#   hold.
+# 99 has two sources (no isolated slot / serial lock wait exhausted), distinguished
+#   explicitly at each exit rather than inferred from the mode. The override is trusted
+#   only when rc is really 99 and the value is one of the two permitted enums, because
+#   99 can also come from the reviewer, and because a TERM arriving after the override is
+#   set would otherwise mislabel a signal death as a full slot table.
+TM_CAT_OVERRIDE=""
+_tm_cat(){ local _rc="${1:-}"
+  if [ "$_rc" = 99 ]; then
+    case "$TM_CAT_OVERRIDE" in slot_full|serial_lock_timeout) printf '%s' "$TM_CAT_OVERRIDE";;
+      *) printf rc99_unattributed;; esac
+    return 0
+  fi
+  case "$_rc" in 0) printf ok;; 8) printf config_reject;; 9) printf no_stdin;; 98) printf token_gate;;
+  124|137) printf timeout_like;; 129|130|143) printf signal;; 3|4|5|6|7) printf bootstrap;;
+  *) printf codex_error;; esac; }
+
+# ---- --preflight: pre-batch admission. It runs no reviewer and needs no stdin, so it
+# must come BEFORE the stdin snapshot ----
+# Threshold = LOCK_WAIT+TIMEOUT+EXP_MARGIN (by default 540+540+900=1980s): in the worst
+# case a task waits the full LOCK_WAIT before its own token check happens.
+# Fail closed: insufficient or unparsable refuses the batch (98). Note that serial mode
+# copies the source credentials into its own home and does not write refreshed ones back,
+# so "run one serial job to refresh the whole batch" does not work.
+if [ "$PREFLIGHT" = 1 ]; then
+  _need=$((LOCK_WAIT + TIMEOUT + EXP_MARGIN))
+  _rem=$(_token_remaining)
+  # Preflight emits a SINGLE event rather than a start/end pair: it runs no reviewer and
+  #   has no execution window, but how often it refuses is one of the questions this
+  #   telemetry exists to answer, so it is not excluded.
+  if [ "$_rem" -lt 0 ]; then
+    TM_TOKEN=unparseable; _tm preflight "$(_tm_common),\"rc\":98,\"exit_category\":\"token_gate\""
+    echo "dual-audit-codex(preflight): access token could not be parsed -> batch refused (fail-closed); 98" >&2; exit 98
+  elif [ "$_rem" -lt "$_need" ]; then
+    TM_TOKEN=insufficient; _tm preflight "$(_tm_common),\"rc\":98,\"exit_category\":\"token_gate\""
+    echo "dual-audit-codex(preflight): remaining ${_rem}s < threshold ${_need}s (LOCK_WAIT+TIMEOUT+EXP_MARGIN) -> batch refused; 98" >&2; exit 98
+  fi
+  TM_TOKEN=sufficient; _tm preflight "$(_tm_common),\"rc\":0,\"exit_category\":\"ok\""
+  echo "dual-audit-codex(preflight): OK, remaining ${_rem}s >= threshold ${_need}s; safe to dispatch a batch (MAX=$MAX)"
+  exit 0
+fi
+
+# ---- Early stdin snapshot, which closes a time-of-check/time-of-use gap: the brief goes straight into a unique private file, with a bounded read (so a stream that never reaches EOF cannot hang here) and an exit-code check (so a truncated read cannot continue silently) ----
+STDIN_SNAP=""; RUN_ROOT=""; _CLEANED=0
+cleanup(){ [ "$_CLEANED" = 1 ] && return 0; _CLEANED=1
+  [ -n "$RUN_ROOT" ] && rm -rf "$RUN_ROOT" 2>/dev/null
+  [ -n "$STDIN_SNAP" ] && rm -f "$STDIN_SNAP" 2>/dev/null
+  return 0; }
+# ONE exit handler: capture rc first, remove the trap to prevent re-entry, release the
+#   slot or serial descriptor before writing telemetry (never hold a lock while writing),
+#   clean up, then make a best-effort end record.
+#   The handler never calls exit, and never lets a command's nonzero status leak into the
+#   script's exit code, which is why it ends with `return 0`.
+_on_exit(){ local _rc=$?
+  trap - EXIT HUP INT TERM
+  exec 9>&- 2>/dev/null || :
+  exec 200>&- 2>/dev/null || :
+  cleanup
+  # On a signal the normal timing line never runs, so compute it here (only when execution had started and nothing was recorded yet)
+  [ "$TM_EXEC_MS" = 0 ] && [ -n "$TM_EXEC_T0" ] && TM_EXEC_MS=$(_dur_ms "$TM_EXEC_T0")
+  [ "$TM_STARTED" = 1 ] && _tm end "$(_tm_common),\"rc\":$_rc,\"exit_category\":\"$(_tm_cat "$_rc")\""
+  return 0; }
+# A signal handler MUST exit explicitly with 128+N. Trapping cleanup on EXIT together
+#   with HUP/INT/TERM makes TERM run cleanup, let the script CONTINUE, run cleanup again,
+#   and finally exit 0 — an aborted review reporting success, which is a false-success
+#   channel.
+trap _on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# A start record carries ONLY the fields that are genuinely known at that moment. Placeholder
+#   values there (slot=null, exec_ms=0, token_status=not_checked) make a naive aggregate over
+#   all rows halve the mean execution time. Omitting the keys instead makes such an aggregate
+#   fail loudly rather than silently produce a wrong number. Final values appear only in the
+#   end record.
+# The schema version exists because rows of DIFFERENT field sets once shared one version
+#   number, and mixing those does not raise an error — it produces a quiet bias. Always
+#   stratify by version before aggregating.
+TM_STARTED=1
+_tm start "$(printf ',"mode":"%s","timeout_s":%s,"batch":%s,"batch_id":%s' "$TM_MODE" "$TIMEOUT" "$BATCH" \
+  "$( [ -n "$TM_BATCH_ID" ] && printf '"%s"' "$TM_BATCH_ID" || printf null )")"
+if [ ! -t 0 ]; then
+  STDIN_SNAP=$(mktemp "${RUNTIME_DIR}/.dual-audit-brief.$$.XXXXXX") || { echo "dual-audit-codex: could not create the brief snapshot" >&2; exit 6; }
+  timeout "$STDIN_TIMEOUT" cat > "$STDIN_SNAP" || { echo "dual-audit-codex: reading the brief from stdin timed out (>${STDIN_TIMEOUT}s) or hit an I/O error" >&2; exit 6; }
+fi
+
+# FIFO/symlink/ownership guards on the shared control-plane paths, so another account cannot pre-create them and hang or deny service to every run
+_guard_path(){ # $1=path $2=kind(file|dir); symlinks (including dangling ones) are refused first, then an existing
+# path must have the right type and be owned by us, otherwise refuse (exit 8)
+  local p="$1" k="$2"
+  [ -L "$p" ] && { echo "dual-audit-codex: $p is a symlink (possibly dangling, and suspicious either way); refusing to run" >&2; exit 8; }   # must precede -e: a dangling symlink makes -e false, which would fail open
+  [ -e "$p" ] || return 0
+  if [ "$k" = file ]; then [ -f "$p" ] || { echo "dual-audit-codex: $p is not a regular file (FIFO or special file?); refusing to run" >&2; exit 8; }; fi
+  if [ "$k" = dir ]; then [ -d "$p" ] || { echo "dual-audit-codex: $p is not a directory; refusing to run" >&2; exit 8; }; fi
+  [ -O "$p" ] || { echo "dual-audit-codex: $p is not owned by this user; refusing to run" >&2; exit 8; }
+}
+
+# ---- --emit-rc injector, shared by BOTH the isolated and serial paths ----
+# Writing this twice was the first version's defect: only the isolated path injected the
+#   marker, so serial runs (explicit --serial, or a token downgrade) silently produced no
+#   marker at all, the driver could never read an exit code, and the panel declared the
+#   reviewer unavailable. One implementation, called from both paths; change it here only.
+#
+# The marker goes before the terminator of EVERY complete VERDICT..END block, not merely
+#   before the last END in the text:
+#   (1) The reviewer CLI sometimes prints the verdict block twice, byte for byte identical,
+#       and the panel folds identical duplicates. Injecting into only the last block makes
+#       the two differ, folding fails, the block is judged ambiguous, and the audit fails
+#       closed forever.
+#   (2) END is only recognised after a VERDICT: line, so a standalone `END` in narrative
+#       prose does not attract a marker (a marker outside a block reads as absent anyway).
+# If there is no block at all (the reviewer crashed or produced nothing), the marker is
+#   appended at the end, so the exit code always has somewhere to land.
+_emit_rc_inject(){   # $1=rc; stdin=reviewer stdout; stdout=the same text with the exit-code marker injected
+  awk -v rc="$1" '
+    $0 ~ /^[ \t]*VERDICT:/ { inblk=1 }
+    inblk && $0 ~ /^[ \t]*END[ \t]*$/ { printf "__DUAL_AUDIT_RC=%s\n", rc; inblk=0; any=1 }
+    { print }
+    END { if (!any) printf "__DUAL_AUDIT_RC=%s\n", rc }
+  '
+}
+
+# ---- Serial fallback: one shared home, serialised by flock. It does not exec, so the
+# cleanup trap still runs ----
+# Isolation level, chosen deliberately: flock serialises runs (only one at a time) and each
+#   still gets its own unique brief snapshot, so tasks cannot be crossed. The SHARED home is
+#   intentional — safely refreshing credentials inside the lock is the entire reason serial
+#   mode exists, so the refresh token is NOT stripped here. --ephemeral is still injected,
+#   as in the isolated path, so sessions do not accumulate in the shared home.
+run_serial(){
+  local FAKE_HOME="$AUDIT_HOME/emptyhome" AUDIT_CWD="$RUNTIME_DIR/.dual-audit-cwd" _anc
+  # Inject --ephemeral immediately after exec (skip if the caller already passed it), mirroring the isolated path
+  local _has_eph=0 _ins=0 a; local _sargs=()
+  for a in "$@"; do case "$a" in --ephemeral) _has_eph=1;; esac; done
+  for a in "$@"; do _sargs+=("$a"); if [ "$_ins" = 0 ] && [ "$_has_eph" = 0 ] && [ "$a" = "exec" ]; then _sargs+=(--ephemeral); _ins=1; fi; done
+  TM_MODE=serial                  # telemetry records the mode that ACTUALLY ran: a run downgraded from isolated counts as serial
+  _guard_path "$LOCK" file        # stops a lock pre-created as a FIFO or symlink from blocking `exec 200>` forever
+  exec 200>"$LOCK" || { echo "dual-audit-codex(serial): could not open the lock" >&2; exit 4; }
+  local _t_ser0; _t_ser0=$(_mono_ms)
+  flock -w "$LOCK_WAIT" 200 || { TM_SERIAL_WAIT_MS=$(_dur_ms "$_t_ser0"); TM_CAT_OVERRIDE=serial_lock_timeout
+    echo "dual-audit-codex(serial): lock not acquired within ${LOCK_WAIT}s; 99" >&2; exit 99; }
+  TM_SERIAL_WAIT_MS=$(_dur_ms "$_t_ser0")     # record the wait even on success (the failure path recorded it above)
+  mkdir -p "$AUDIT_HOME" "$FAKE_HOME" "$AUDIT_CWD" || { echo "dual-audit-codex(serial): could not create directories" >&2; exit 5; }
+  # Serial mode is the ONE path that writes a credential to a long-lived location, so it gets the
+  # same guard the per-run runtime directory already had. `mkdir -p` follows a symlinked directory
+  # and `cp -f` follows a symlinked file, so without this a link planted at either name sends the
+  # credential to a path nobody examined. Checked AFTER mkdir, because the directory may not have
+  # existed yet, and BEFORE the first write.
+  for _d in "$STATE_DIR" "$AUDIT_HOME"; do
+    [ -L "$_d" ] && { echo "dual-audit-codex(serial): $_d is a symlink; refusing to run" >&2; exit 8; }
+    [ -O "$_d" ] || { echo "dual-audit-codex(serial): $_d is not owned by this user; refusing to run" >&2; exit 8; }
+  done
+  chmod 700 "$STATE_DIR" "$AUDIT_HOME" 2>/dev/null || true
+  for _f in "$AUDIT_HOME/auth.json" "$AUDIT_HOME/config.toml"; do
+    [ -L "$_f" ] && { echo "dual-audit-codex(serial): $_f is a symlink; refusing to write a credential through it" >&2; exit 8; }
+  done
+  cp -f "$SRC_AUTH" "$AUDIT_HOME/auth.json" 2>/dev/null || { echo "dual-audit-codex(serial): authentication file not found ($SRC_AUTH)" >&2; exit 3; }
+  chmod 600 "$AUDIT_HOME/auth.json"
+  cat > "$AUDIT_HOME/config.toml" <<'EOF' || { echo "dual-audit-codex(serial): could not write config" >&2; exit 6; }
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+[features]
+use_legacy_landlock = true
+memories = false
+[projects."/tmp"]
+trust_level = "trusted"
+EOF
+  if [ -L "$AUDIT_CWD" ] || [ ! -O "$AUDIT_CWD" ]; then echo "dual-audit-codex(serial): the neutral working directory is unsafe (symlink, or not owned by this user)" >&2; exit 8; fi
+  _anc="$AUDIT_CWD"; while :; do [ -e "$_anc/.codex/superpowers" ] && { echo "dual-audit-codex(serial): an ancestor directory carries injectable skill configuration" >&2; exit 8; }; [ "$_anc" = "/" ] && break; _anc=$(dirname "$_anc"); done
+  cd "$AUDIT_CWD" || { echo "dual-audit-codex(serial): cd failed" >&2; exit 7; }
+  # 200>&- : do not let the reviewer subtree inherit the lock descriptor, or an orphan
+  #   could hold the lock
+  # exec_ms covers the reviewer call only, not lock acquisition, setup or cleanup
+  local _rc; TM_EXEC_T0=$(_mono_ms)
+  if [ -n "$STDIN_SNAP" ]; then
+    if [ "$EMIT_RC" = 1 ]; then
+      # rc MUST be captured BEFORE the pipe: once `| _emit_rc_inject` is appended, $? is
+      #   awk's exit code, not the reviewer's.
+      local _so
+      _so=$(timeout -k "$KILL_AFTER" "$TIMEOUT" env HOME="$FAKE_HOME" CODEX_HOME="$AUDIT_HOME" "$REAL_CODEX" ${_sargs+"${_sargs[@]}"} < "$STDIN_SNAP" 200>&-)
+      _rc=$?
+      printf '%s\n' "$_so" | _emit_rc_inject "$_rc"
+    else
+      timeout -k "$KILL_AFTER" "$TIMEOUT" env HOME="$FAKE_HOME" CODEX_HOME="$AUDIT_HOME" "$REAL_CODEX" ${_sargs+"${_sargs[@]}"} < "$STDIN_SNAP" 200>&-
+      _rc=$?
+    fi
+  else
+    # Defence in depth: the non-empty brief guard upstream should make this unreachable. If it is reached, a guard was bypassed -> refuse, and never feed /dev/null to a review
+    echo "dual-audit-codex(serial): no brief snapshot (was a guard bypassed?); refusing to run" >&2
+    return 9
+  fi
+  TM_EXEC_MS=$(_dur_ms "$TM_EXEC_T0")   # rc was already captured in each branch above
+  return $_rc
+}
+
+# ---- Non-empty brief guard, shared by both modes; it MUST sit BEFORE the serial dispatch ----
+# With the guard after the dispatch, and testing only that the VARIABLE was set, three
+#   different paths could run a ZERO-BYTE brief to completion, so a review "finished"
+#   without ever receiving a question:
+#     (1) serial with a TTY, which fed /dev/null;
+#     (2) isolated with an empty file, where the snapshot variable was set;
+#     (3) a brief generator that failed but exited 0.
+#   Recorded honestly: the wrapper itself did not refuse a zero-byte brief and left the
+#   outcome to the reviewer, which happened to exit nonzero. The value of this guard is a
+#   wrapper-level invariant plus an early exit 9 that takes no slot and starts no reviewer.
+# The test must be -s (file is non-empty), not -n/-z (variable is set).
+if [ -z "$STDIN_SNAP" ]; then
+  echo "dual-audit-codex: the brief must be piped in on stdin (an empty TTY is refused); for example: dual-audit-codex exec ... - < <(gen_brief)" >&2
+  exit 9
+fi
+if [ ! -s "$STDIN_SNAP" ]; then
+  echo "dual-audit-codex: the brief is zero bytes (empty stdin? generator failed?); refusing to run -- an empty brief would report success while reviewing nothing" >&2
+  exit 9
+fi
+
+[ "$MODE" = serial ] && { run_serial "$@"; exit $?; }
+
+# ==================== isolated: the default path ====================
+
+# Slot control-plane guards (symlink and ownership, validated before chmod so nothing is followed) plus the semaphore
+[ -L "$SLOT_DIR" ] && { echo "dual-audit-codex: $SLOT_DIR is a symlink; refusing to run" >&2; exit 8; }
+mkdir -p "$SLOT_DIR" 2>/dev/null
+{ [ -d "$SLOT_DIR" ] && [ ! -L "$SLOT_DIR" ] && [ -O "$SLOT_DIR" ]; } || { echo "dual-audit-codex: $SLOT_DIR is unsafe (symlink, not a directory, or not owned by this user); refusing to run" >&2; exit 8; }
+chmod 700 "$SLOT_DIR" 2>/dev/null || true
+SECONDS=0   # reset, so an inherited SECONDS cannot corrupt LOCK_WAIT semantics
+SLOT_HELD=""
+_t_slot0=$(_mono_ms)     # timed independently of SECONDS: SECONDS belongs to LOCK_WAIT semantics and is not shared
+while :; do
+  for i in $(seq 1 "$MAX"); do
+    if exec 9>"$SLOT_DIR/slot$i" && flock -n 9; then SLOT_HELD="$i"; break; fi
+    exec 9>&-
+  done
+  [ -n "$SLOT_HELD" ] && break
+  [ "$SECONDS" -ge "$LOCK_WAIT" ] && { TM_SLOT_WAIT_MS=$(_dur_ms "$_t_slot0"); TM_CAT_OVERRIDE=slot_full
+    echo "dual-audit-codex: ${MAX} concurrent slots were all busy for ${LOCK_WAIT}s; exiting 99" >&2; exit 99; }
+  sleep 0.5
+done
+TM_SLOT_WAIT_MS=$(_dur_ms "$_t_slot0"); TM_SLOT="$SLOT_HELD"   # queue time is the primary thing this telemetry exists to measure
+
+# The token-lifetime check happens AFTER a slot is held, so queueing counts towards it.
+#   Two outcomes:
+#   single task (default): insufficient or unparsable -> release the slot and downgrade to
+#     serial, where one shared home can refresh credentials safely inside the lock.
+#   --batch: no serial downgrade. Release the slot and return a structured admission
+#     failure (98) so the scheduler stops adding work.
+#     Reason: a downgraded task frees its slot, letting the next task pour into the same
+#     global serial lock, so the number of serial contenders is set by batch width rather
+#     than by the concurrency cap. With many tasks downgrading at once, the first few run
+#     and the rest each wait out their own LOCK_WAIT and mostly exit 99.
+REM=$(_token_remaining)
+if [ "$REM" -lt 0 ]; then TM_TOKEN=unparseable
+elif [ "$REM" -lt $((TIMEOUT + EXP_MARGIN)) ]; then TM_TOKEN=insufficient
+else TM_TOKEN=sufficient; fi          # record the category only, never the remaining seconds (those would reveal when the token was issued)
+if [ "$REM" -lt 0 ] || [ "$REM" -lt $((TIMEOUT + EXP_MARGIN)) ]; then
+  exec 9>&-
+  if [ "$BATCH" = 1 ]; then
+    echo "dual-audit-codex(batch): access_token token has only ${REM}s left (< timeout+margin=$((TIMEOUT+EXP_MARGIN))s) or could not be parsed -> admission failed, no serial downgrade; 98" >&2
+    exit 98
+  fi
+  echo "dual-audit-codex: access_token token has only ${REM}s left (< timeout+margin=$((TIMEOUT+EXP_MARGIN))s) or could not be parsed -> releasing the slot and downgrading to serial" >&2
+  run_serial "$@"; exit $?
+fi
+
+# Private run root
+RUN_ROOT="$(mktemp -d "${RUNTIME_DIR}/dual-audit-run.$$.XXXXXX")" || { echo "dual-audit-codex: could not create the private run directory (disk full?)" >&2; exit 5; }
+: > "$RUN_ROOT/.dual-audit-marker" || { echo "dual-audit-codex: could not write the ownership marker" >&2; exit 5; }
+EHOME="$RUN_ROOT/emptyhome"; CWD="$RUN_ROOT/cwd"; mkdir -p "$EHOME" "$CWD" || { echo "dual-audit-codex: could not create the private subdirectories" >&2; exit 5; }
+
+# Reaper: removes leftovers that are ours (-O), match the name pattern, and whose owning
+#   PID is dead (run roots and brief snapshots).
+#   It relies on neither a marker nor age: a leftover worker holding a file can make the
+#   trap's removal partially fail and leave an orphan with no marker, whereas a dead PID
+#   is conclusive and cannot delete a live task's directory.
+_reap(){ # $1=name glob $2=type(d|f); the name must end in .<PID>.<random>
+  find "$RUNTIME_DIR" -maxdepth 1 -name "$1" -type "$2" 2>/dev/null | while read -r p; do
+    [ "$p" = "${RUN_ROOT:-}" ] && continue
+    [ "$p" = "${STDIN_SNAP:-}" ] && continue
+    [ -O "$p" ] || continue
+    pid=$(printf '%s' "$p" | sed -n 's#.*\.\([0-9]\{1,\}\)\.[^.]*$#\1#p')
+    [ -n "$pid" ] || continue                                 # no PID could be parsed -> we cannot prove it is stale, so skip it rather than delete a foreign name
+    kill -0 "$pid" 2>/dev/null && continue                    # the owning process is still alive -> never delete
+    rm -rf "$p" 2>/dev/null
+  done
+}
+_reap "dual-audit-run.*" d
+_reap ".dual-audit-brief.*" f
+
+# Private access-token-only credentials (refresh token removed) with mode 600
+timeout 30 python3 - "$SRC_AUTH" "$RUN_ROOT/auth.json" <<'PY' || { echo "dual-audit-codex: could not write the private authentication file" >&2; exit 3; }
+import json,sys
+d=json.load(open(sys.argv[1]))
+if isinstance(d.get("tokens"),dict): d["tokens"]["refresh_token"]=""
+json.dump(d, open(sys.argv[2],"w"))
+PY
+chmod 600 "$RUN_ROOT/auth.json"
+cat > "$RUN_ROOT/config.toml" <<'EOF' || { echo "dual-audit-codex: could not write the private config" >&2; exit 6; }
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+[features]
+use_legacy_landlock = true
+memories = false
+[projects."/tmp"]
+trust_level = "trusted"
+EOF
+
+# Move the already-snapshotted brief into place (no time-of-use gap, it is on disk already) and clear the variable so cleanup does not remove it twice
+mv "$STDIN_SNAP" "$RUN_ROOT/brief.md" || { echo "dual-audit-codex: could not move the brief into place" >&2; exit 6; }
+STDIN_SNAP=""
+
+# Private working-directory checks: symlink, ownership, and no injectable skill configuration anywhere up the ancestor chain
+if [ -L "$CWD" ] || [ ! -O "$CWD" ]; then echo "dual-audit-codex: the private working directory is unsafe (symlink, or not owned by this user); refusing to run" >&2; exit 8; fi
+_anc="$CWD"; while :; do [ -e "$_anc/.codex/superpowers" ] && { echo "dual-audit-codex: ancestor $_anc carries injectable skill configuration; refusing to run" >&2; exit 8; }; [ "$_anc" = "/" ] && break; _anc=$(dirname "$_anc"); done
+
+# Inject --ephemeral immediately after exec (skip if the caller already passed it)
+NEWARGS=(); has_eph=0
+for a in "$@"; do case "$a" in --ephemeral) has_eph=1;; esac; done
+inserted=0
+for a in "$@"; do NEWARGS+=("$a"); if [ "$inserted" = 0 ] && [ "$has_eph" = 0 ] && [ "$a" = "exec" ]; then NEWARGS+=(--ephemeral); inserted=1; fi; done
+
+# A neutral private working directory cuts off directory-based configuration discovery; no exec, so the trap can clean up; timeout rather than killing by name; and 9>&- keeps the slot descriptor away from the reviewer subtree so an orphan cannot hold a slot
+cd "$CWD" || { echo "dual-audit-codex: could not cd into the private working directory" >&2; exit 7; }
+TM_EXEC_T0=$(_mono_ms)   # exec_ms covers the reviewer call only, not slot waiting, setup or cleanup
+if [ "$EMIT_RC" = 1 ]; then
+  # ---- --emit-rc: write the real exit code INSIDE the verdict block, not after it ----
+  # The exit code otherwise exists only as a process status (the `exit "$RC"` below), and a
+  # caller that receives only text cannot observe it. Having the forwarder print `$?` after
+  # the block does not survive: forwarders truncate output at `END` and that line is
+  # silently dropped. A line INSIDE the block must be forwarded verbatim with the block, so
+  # losing it breaks the panel's VERDICT..END parsing — a loud failure instead of a silent one.
+  # Cost: output is no longer streamed, since injection needs the whole text. Acceptable,
+  # because the caller waits for completion anyway.
+  # Defaulting this OFF is load-bearing: this wrapper is shared infrastructure used by other
+  # callers, and defaulting it on would rewrite every caller's stdout.
+  _EMIT_OUT=$(timeout -k "$KILL_AFTER" "$TIMEOUT" \
+    env HOME="$EHOME" CODEX_HOME="$RUN_ROOT" "$REAL_CODEX" ${NEWARGS+"${NEWARGS[@]}"} < "$RUN_ROOT/brief.md" 9>&-)
+  RC=$?                  # MUST be captured before the pipe: once `| _emit_rc_inject` is added, $? is awk exit code
+  printf '%s\n' "$_EMIT_OUT" | _emit_rc_inject "$RC"   # injection rules are defined at _emit_rc_inject
+  unset _EMIT_OUT
+else
+  timeout -k "$KILL_AFTER" "$TIMEOUT" \
+    env HOME="$EHOME" CODEX_HOME="$RUN_ROOT" "$REAL_CODEX" ${NEWARGS+"${NEWARGS[@]}"} < "$RUN_ROOT/brief.md" 9>&-
+  RC=$?                  # capture rc as the very first thing after the subcommand returns, before any telemetry
+fi
+TM_EXEC_MS=$(_dur_ms "$TM_EXEC_T0")
+exit "$RC"   # triggers trap _on_exit -> release fds, remove the private home, write the end record

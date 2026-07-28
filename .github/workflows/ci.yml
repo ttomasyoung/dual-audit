@@ -1,0 +1,91 @@
+name: CI
+
+# Deterministic only. No paid model is ever called: the reviewers are stubbed in the protocol
+# tests, and the wrapper tests exercise refusal paths, so nothing here needs a credential.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (ubuntu-24.04, node ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Required utilities are present
+        run: |
+          for u in bash flock mktemp timeout awk sed grep find sha256sum; do
+            command -v "$u" >/dev/null || { echo "missing: $u"; exit 1; }
+          done
+
+      - name: Stub the Codex CLI
+        # doctor treats a missing reviewer CLI as a real problem, and it is right to. CI is not
+        # reviewing anything, so a stub satisfies the presence check without a credential and
+        # without a paid call. Every test here exercises refusal paths and stubbed protocol
+        # behaviour; nothing in this file can reach a model.
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/codex"
+          chmod +x "$HOME/.local/bin/codex"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run every suite
+        run: bash tests/run-all.sh
+
+  lint:
+    name: shell and sanitisation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1091: sourced paths are resolved at run time.
+          # SC2317: functions invoked only from a trap look unreachable to the analyser.
+          shellcheck -S warning -e SC1091,SC2317 \
+            install.sh uninstall.sh \
+            runtime/core/dual-audit \
+            runtime/codex-auditor/dual-audit-codex \
+            runtime/codex-auditor/dual-audit-lint \
+            scripts/sanitize-scan.sh \
+            tests/*.sh
+
+      - name: No secrets, personal paths, e-mail or non-English source text
+        run: bash scripts/sanitize-scan.sh
+
+  install:
+    name: install and remove in a throwaway home
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Stub the Codex CLI
+        # doctor treats a missing reviewer CLI as a real problem, and it is right to. CI is not
+        # reviewing anything, so a stub satisfies the presence check without a credential and
+        # without a paid call. Every test here exercises refusal paths and stubbed protocol
+        # behaviour; nothing in this file can reach a model.
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexit 0\n' > "$HOME/.local/bin/codex"
+          chmod +x "$HOME/.local/bin/codex"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: install, doctor, uninstall
+        run: bash tests/test_install.sh

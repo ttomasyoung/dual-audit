@@ -1,0 +1,14 @@
+# local run artifacts
+*.log
+.tmp/
+tmp/
+node_modules/
+
+# never commit anything that could carry credentials or run state
+auth.json
+*.pem
+*.key
+runs.jsonl
+
+# a packager's private vocabulary for the pre-publication scan — local only, never shipped
+.private-terms

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# dual-audit:package-file (installed by dual-audit; ownership marker — do not remove)
+# dual-audit-lint — find read-only reviewer calls that BYPASS the hardened wrapper.
+#
+# Why this matters: when several review sessions run on one machine, writing a brief to a
+# fixed or shared path and then running the reviewer CLI directly lets another session
+# overwrite that file between write and read, so the reviewer audits the WRONG task. The
+# result looks like a normal, confident review. The single legitimate entry point is
+# `dual-audit-codex`, which pipes the brief in on stdin, snapshots it immediately into a
+# unique private file, and runs under a private home with a slot semaphore.
+#
+# Run it after adding or editing any agent, workflow, skill or command that calls a
+# reviewer CLI.
+#   exit 0 = clean, 1 = bypass found, 2 = the linter could not run.
+#
+# The patterns are deliberately narrow, so prose that merely mentions the CLI is not
+# flagged; only real call shapes are.
+set -uo pipefail
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+ROOTS=("$CLAUDE_DIR/agents" "$CLAUDE_DIR/workflows" "$CLAUDE_DIR/skills" "$CLAUDE_DIR/commands")
+[ "$#" -gt 0 ] && ROOTS=("$@")
+
+RPT="$(mktemp "${TMPDIR:-/tmp}/dual-audit-lint.XXXXXX")" || { echo "dual-audit-lint: mktemp failed" >&2; exit 2; }
+trap 'rm -f "$RPT"' EXIT
+
+# Documentation that deliberately shows the FORBIDDEN pattern as an example can opt out by
+# putting this marker on the same line.
+IGNORE='dual-audit-lint:ignore'
+
+for r in "${ROOTS[@]}"; do
+  [ -d "$r" ] || continue
+
+  # (A) A bare reviewer call reading a fixed file through command substitution:
+  #     `codex exec ... "$(cat FIXED_PATH)"`
+  grep -rnE 'codex[[:space:]]+exec' "$r" 2>/dev/null \
+    | grep -F '$(cat ' | grep -vF 'dual-audit-codex' | grep -vF "$IGNORE" \
+    | sed 's#^#[A bare reviewer call reading a fixed file] #' >> "$RPT" || true
+
+  # (B) A shared, predictable brief path that another session can overwrite.
+  grep -rnE '/tmp/[A-Za-z0-9_.-]*(codex|audit|brief)[A-Za-z0-9_.-]*\.(txt|md|json)' "$r" 2>/dev/null \
+    | grep -vF "$IGNORE" \
+    | sed 's#^#[B fixed shared brief path] #' >> "$RPT" || true
+
+  # (C) A bare reviewer call taking stdin from a fixed temporary file.
+  grep -rnE 'codex[[:space:]]+exec' "$r" 2>/dev/null \
+    | grep -E '<[[:space:]]*"?/tmp/' | grep -vF 'dual-audit-codex' | grep -vF "$IGNORE" \
+    | sed 's#^#[C bare reviewer call redirecting from a fixed temporary file] #' >> "$RPT" || true
+
+  # (D) A reviewer call that removes the read-only sandbox.
+  grep -rnE 'codex[[:space:]]+exec[^|]*(--sandbox[[:space:]]+workspace-write|--dangerously-bypass-approvals)' "$r" 2>/dev/null \
+    | grep -vF "$IGNORE" \
+    | sed 's#^#[D review call without the read-only sandbox] #' >> "$RPT" || true
+done
+
+# Count in the parent shell: a `grep | while` pipeline would lose the count in a subshell.
+n="$(wc -l < "$RPT" | tr -d ' ')"
+if [ "${n:-0}" -gt 0 ]; then
+  echo "FAIL dual-audit-lint: $n reviewer call(s) bypass dual-audit-codex (parallel sessions can cross-contaminate):"
+  echo "------------------------------------------------------------------"
+  cat "$RPT"
+  echo "------------------------------------------------------------------"
+  echo "The only supported form is:"
+  echo "  dual-audit-codex exec --sandbox read-only --skip-git-repo-check --emit-rc - <<'EOF'"
+  echo "  <brief>"
+  echo "  EOF"
+  echo "If a line deliberately shows the forbidden pattern as an example, mark it with: $IGNORE"
+  exit 1
+fi
+echo "OK dual-audit-lint: no bypasses found (scanned agents, workflows, skills and commands)"
+exit 0

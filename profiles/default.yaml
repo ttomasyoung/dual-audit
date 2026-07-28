@@ -1,0 +1,72 @@
+# dual-audit:package-file (installed by dual-audit; ownership marker — do not remove)
+# dual-audit — default profile (domain neutral)
+#
+# This file is owned by the package and is overwritten on upgrade.
+# Do not edit it. Put your own rules in ~/.config/dual-audit/profile.yaml.
+#
+# Supported YAML subset (see docs/configuration.md): maps, lists of maps,
+# lists of scalars, plain and quoted single-line scalars, "#" comments,
+# empty flow list "[]". Anything else is rejected loudly.
+
+version: 1
+name: default
+
+# ---------------------------------------------------------------------------
+# routing — which requests deserve which route.
+# The skills read this. Nothing here is executed; it is decision guidance
+# for the controller, and it stays deliberately domain neutral.
+# ---------------------------------------------------------------------------
+routing:
+
+  # Route 3 — full dual audit (bounded panel, at most three rounds).
+  full_audit_triggers:
+    - id: facts-definitions-thresholds
+      description: "Changes to facts, definitions, thresholds, or decision rules that later work is judged against."
+    - id: load-bearing-output
+      description: "Output that becomes a load-bearing input for downstream work, where a silent error propagates instead of surfacing."
+    - id: rules-and-contracts
+      description: "Rules, SOPs, schemas, interface contracts, permissions, or critical configuration."
+    - id: irreversible-action
+      description: "Irreversible, destructive, production, deployment, or external-state actions."
+    - id: multi-agent-plan
+      description: "A plan that other agents or people will execute without re-deriving its assumptions."
+    - id: user-critical-area
+      description: "Anything listed in critical_areas below."
+
+  # Route 2 — light audit (one independent read-only Codex opinion, at most two attempts).
+  light_audit_triggers:
+    - id: small-disagreement
+      description: "A small disagreement or a suspected mistake, where one outside opinion is enough."
+    - id: run-did-not-settle-it
+      description: "A deterministic run was attempted and did not settle the question."
+    - id: explicit-request
+      description: "The user explicitly asked for a lightweight second opinion."
+    - id: panel-leftovers
+      description: "Closing out individual points a full panel left unresolved."
+
+  # Route 1 — direct verification, no review.
+  direct_triggers:
+    - id: reversible-and-cheap
+      description: "Low-risk and reversible: a single re-run removes the consequence."
+    - id: deterministically-checkable
+      description: "A deterministic check, smoke test, or dry-run resolves the question. Prefer facts over opinions when facts are cheap."
+    - id: status-reporting
+      description: "Reporting execution state (job ids, exit codes, output paths) that carries no judgement or release opinion."
+
+# ---------------------------------------------------------------------------
+# critical_areas — user-owned. Empty here on purpose: the package ships no
+# opinion about what matters in your work.
+# ---------------------------------------------------------------------------
+critical_areas: []
+
+# ---------------------------------------------------------------------------
+# projects — optional per-project anchors injected into both reviewers' briefs
+# when the caller passes a matching `project` argument.
+# ---------------------------------------------------------------------------
+projects: []
+
+# ---------------------------------------------------------------------------
+# evidence — extra text appended to every brief. Empty in the default profile.
+# ---------------------------------------------------------------------------
+evidence:
+  brief_note: ""

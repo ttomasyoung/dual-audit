@@ -1,0 +1,58 @@
+# dual-audit:package-file (installed by dual-audit; ownership marker — do not remove)
+# dual-audit — research profile (optional)
+#
+# Adds evidence-anchoring discipline for work whose conclusions are claims
+# about the world rather than about code. It only ADDS requirements; it never
+# relaxes a gate from the default profile.
+#
+# Enable it in ~/.config/dual-audit/profile.yaml with:  base: research
+#
+# This file is owned by the package and is overwritten on upgrade.
+
+version: 1
+name: research
+
+routing:
+
+  full_audit_triggers:
+    - id: facts-definitions-thresholds
+      description: "Changes to facts, definitions, thresholds, or decision rules that later work is judged against."
+    - id: load-bearing-output
+      description: "Output that becomes a load-bearing input for downstream work, where a silent error propagates instead of surfacing."
+    - id: rules-and-contracts
+      description: "Rules, SOPs, schemas, interface contracts, permissions, or critical configuration."
+    - id: irreversible-action
+      description: "Irreversible, destructive, production, deployment, or external-state actions."
+    - id: multi-agent-plan
+      description: "A plan that other agents or people will execute without re-deriving its assumptions."
+    - id: domain-claim
+      description: "A claim about the domain itself: a definition, a mechanism, a threshold, or a classification that downstream work will treat as settled."
+    - id: costly-or-unrepeatable-run
+      description: "A run that is expensive or cannot be repeated, where being wrong is not fixed by re-running."
+    - id: user-critical-area
+      description: "Anything listed in critical_areas below."
+
+  light_audit_triggers:
+    - id: small-disagreement
+      description: "A small disagreement or a suspected mistake, where one outside opinion is enough."
+    - id: run-did-not-settle-it
+      description: "A deterministic run was attempted and did not settle the question."
+    - id: explicit-request
+      description: "The user explicitly asked for a lightweight second opinion."
+    - id: panel-leftovers
+      description: "Closing out individual points a full panel left unresolved."
+
+  direct_triggers:
+    - id: reversible-and-cheap
+      description: "Low-risk and reversible: a single re-run removes the consequence."
+    - id: deterministically-checkable
+      description: "A deterministic check, smoke test, or dry-run resolves the question."
+    - id: status-reporting
+      description: "Reporting execution state that carries no judgement or release opinion."
+
+critical_areas: []
+
+projects: []
+
+evidence:
+  brief_note: "EVIDENCE DISCIPLINE (research profile). Anchor every substantive claim to a source a third party can check: primary literature, a canonical document, a structure or dataset, or a measurement. Prior definitions and published statements are not automatically true - follow the evidence chain, distinguish a decisive result from an anecdotal one, and note when a method is weak for the claim it is being used to support. Rank evidence explicitly: experiment with independent cross-validation > high-throughput screen > single-case definition > similarity-based inference > model inference. Agreement between two AI reviewers is NOT evidence. If a claim cannot be anchored, say so and mark it for human expert sign-off instead of converging on it."
