@@ -11,13 +11,19 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
-const DRIVER = resolve(HERE, '../runtime/claude-controller/dual-audit-run.js')
+// Both the file under test and the marker name are overridable so that ONE suite can be pointed at a
+// differently-named build of the same driver. Without this the suite silently only ever covered the
+// copy sitting next to it, and a second deployed copy could drift arbitrarily with nothing to notice:
+// pointing this suite at such a copy for the first time turned up a whole classification layer that
+// had never been ported. A test that can only reach one of two live copies is half a test.
+const DRIVER = process.env.DUAL_AUDIT_DRIVER || resolve(HERE, '../runtime/claude-controller/dual-audit-run.js')
+const RCM = process.env.DUAL_AUDIT_RC_MARKER || '__DUAL_AUDIT_RC'
 const SRC0 = readFileSync(DRIVER, 'utf8').replace('export const meta', 'const meta')
 const AF = Object.getPrototypeOf(async function () {}).constructor
 
 // A verdict block carrying the wrapper-injected exit-code marker.
 const block = (rc, verdict = 'APPROVE') =>
-  `VERDICT: ${verdict}\nP0: none\nEVIDENCE: read 3 files, 42 lines\nVERIFIED: pass\n__DUAL_AUDIT_RC=${rc}\nEND`
+  `VERDICT: ${verdict}\nP0: none\nEVIDENCE: read 3 files, 42 lines\nVERIFIED: pass\n${RCM}=${rc}\nEND`
 
 /**
  * Run the driver against a scripted sequence of panel replies.
@@ -185,27 +191,27 @@ await t('B2 nonzero exit code is forwarded verbatim (never normalised to 0)',
 await t('B3 marker OUTSIDE any block -> not forwarded + diagnostic',
   (m) => runDriver({
     panelReplies: [PENDING, { converged: false, convergence_status: 'codex_unavailable' }],
-    agentReply: 'VERDICT: APPROVE\nP0: none\nEVIDENCE: 1 file\nVERIFIED: pass\nEND\n__DUAL_AUDIT_RC=0', mutate: m }),
+    agentReply: `VERDICT: APPROVE\nP0: none\nEVIDENCE: 1 file\nVERIFIED: pass\nEND\n${RCM}=0`, mutate: m }),
   (r, g) => g.panelArgsSeen[1] && !('codex_exit_code' in g.panelArgsSeen[1]) &&
-            r.rc_diagnostics.length === 1 && /NOT inside any verdict block/.test(r.rc_diagnostics[0].why))
+            r.rc_diagnostics.length === 1 && r.rc_diagnostics[0].code === 'MARKER_OUTSIDE_ANY_BLOCK')
 
 await t('B4 two markers in the last block -> ambiguous, not forwarded',
   (m) => runDriver({
     panelReplies: [PENDING, { converged: false, convergence_status: 'codex_unavailable' }],
-    agentReply: 'VERDICT: APPROVE\nP0: none\nEVIDENCE: 2 files\nVERIFIED: pass\n__DUAL_AUDIT_RC=0\n__DUAL_AUDIT_RC=137\nEND', mutate: m }),
-  (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) && /ambiguous/.test(r.rc_diagnostics[0].why))
+    agentReply: `VERDICT: APPROVE\nP0: none\nEVIDENCE: 2 files\nVERIFIED: pass\n${RCM}=0\n${RCM}=137\nEND`, mutate: m }),
+  (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) && r.rc_diagnostics[0].code === 'MARKER_AMBIGUOUS_IN_LAST_BLOCK')
 
 await t('B5 marker only in an EARLIER block -> diagnosed as inconsistent injection, not as a missing wrapper',
   (m) => runDriver({
     panelReplies: [PENDING, { converged: false, convergence_status: 'codex_unavailable' }],
     agentReply: block(0) + '\n' + 'VERDICT: APPROVE\nP0: none\nEVIDENCE: 9 lines\nVERIFIED: pass\nEND', mutate: m }),
-  (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) && /EARLIER block/.test(r.rc_diagnostics[0].why),
+  (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) && r.rc_diagnostics[0].code === 'MARKER_IN_EARLIER_BLOCK',
   (s) => s.replace('const inLast = nBlocks ? countMarkers(blocks[nBlocks - 1]) : 0',
                    'const inLast = nBlocks ? countMarkers(blocks.join("\\n")) : 0'))
 
 await t('B6 empty reviewer output -> not forwarded, diagnosed, never a pass',
   (m) => runDriver({ panelReplies: [PENDING, { converged: false, convergence_status: 'codex_unavailable' }], agentReply: '', mutate: m }),
-  (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) && /empty/.test(r.rc_diagnostics[0].why) &&
+  (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) && r.rc_diagnostics[0].code === 'EMPTY_VERDICT_TEXT' &&
             r.terminal_state === 'INFRASTRUCTURE_BLOCKED')
 
 console.log('=== C. Verbatim forwarding and argument threading ===')
@@ -240,6 +246,63 @@ await t('C5 a later round converging still reports CONVERGED and keeps the trace
                    { converged: true, convergence_status: 'converged', audit_stage: 'converged_r2' }],
     agentReply: block(0), mutate: m }),
   (r) => r.terminal_state === 'CONVERGED' && r.panel_calls === 3 && r.driver_trace.length === 3)
+
+// Backward-compatible read of the renamed status. The risk of a rename is not "the new name is not
+// recognised" - that fails loudly at once - but "the OLD name is silently treated as a terminal
+// state": an unsynced panel copy or a replayed old record takes that path, and it presents as "the
+// panel has reached a conclusion", which looks exactly like real convergence. So this is the
+// good-example-not-falsely-rejected side of the calibration and it must not be dropped.
+await t('C6 the old r1_pending_codex still counts as a handoff (compat read; misreading it as terminal collapses the panel to one side silently)',
+  (m) => runDriver({
+    panelReplies: [{ audit_stage: 'r1_pending_codex', codex_brief: 'brief text', prior_state: { round: 1 } },
+                   { converged: true, convergence_status: 'converged', audit_stage: 'converged_r1' }],
+    agentReply: block(0), mutate: m }),
+  (r) => r.terminal_state === 'CONVERGED' && r.panel_calls === 2,
+  (s) => s.replace('/_(handoff_to|pending)_codex$/', '/_(handoff_to)_codex$/'))
+
+// C7/C8 exist because a reader misread a real run. Two reviewer attempts happened in one round: the
+// first was killed by a caller-imposed wall-clock ceiling and returned only a forwarder status report,
+// the second returned a complete verdict. The result then carried "no VERDICT..END block and no
+// marker" next to a panel advisory quoting the marker it had just read, and that pair was read as a
+// self-contradiction meaning "the reviewer never ran". Nothing was wrong with the parser; the record
+// simply never said which attempt it described. C8 is the other half of the calibration: a diagnostic
+// that genuinely was never superseded must NOT be labelled as superseded.
+const FORWARDER_STATUS = 'FORWARDER STATUS: the reviewer process was killed by the caller before it produced a verdict. No VERDICT block exists.'
+
+await t('C7 a failed attempt diagnostic is marked SUPERSEDED once a later attempt returns a verdict',
+  (m) => runDriver({
+    panelReplies: [{ audit_stage: 'r1_handoff_to_codex', codex_brief: 'b', prior_state: { round: 1 } },
+                   { audit_stage: 'r2_handoff_to_codex', codex_brief: 'b', prior_state: { round: 2 } },
+                   { converged: true, convergence_status: 'converged', audit_stage: 'converged_r2' }],
+    agentReply: (i) => (i === 0 ? FORWARDER_STATUS : block(0)), mutate: m }),
+  (r) => {
+    const d = r.rc_diagnostics || []
+    return d.length === 1 && d[0].call === 1 && d[0].superseded_by_call === 2 &&
+      /superseded by call2/.test(d[0].why) && /call1:/.test(d[0].why)
+  },
+  (s) => s.replace('if (d.superseded_by_call == null) {', 'if (false) {'))
+
+await t('C8 a diagnostic that was never superseded keeps superseded_by_call null (good example not mislabelled)',
+  (m) => runDriver({
+    panelReplies: [{ audit_stage: 'r1_handoff_to_codex', codex_brief: 'b', prior_state: { round: 1 } },
+                   { converged: false, convergence_status: 'not_converged', audit_stage: 'escalate_to_user', blockers: ['x'] }],
+    agentReply: FORWARDER_STATUS, mutate: m }),
+  (r) => {
+    const d = r.rc_diagnostics || []
+    return d.length === 1 && d[0].superseded_by_call === null && !/superseded/.test(d[0].why)
+  },
+  (s) => s.replace('superseded_by_call: null,', 'superseded_by_call: 1,'))
+
+await t('C9 the diagnostic carries the evidence it judged, so the reader need not open a journal',
+  (m) => runDriver({
+    panelReplies: [{ audit_stage: 'r1_handoff_to_codex', codex_brief: 'b', prior_state: { round: 1 } },
+                   { converged: false, convergence_status: 'not_converged', audit_stage: 'escalate_to_user', blockers: ['x'] }],
+    agentReply: FORWARDER_STATUS, mutate: m }),
+  (r) => {
+    const d = (r.rc_diagnostics || [])[0] || {}
+    return d.verdict_text_len === FORWARDER_STATUS.length && /No VERDICT block exists\.$/.test(d.verdict_text_tail || '')
+  },
+  (s) => s.replace('verdict_text_tail: String(verdictText).slice(-160),', 'verdict_text_tail: null,'))
 
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
 process.exit(fail ? 1 : 0)
