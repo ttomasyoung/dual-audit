@@ -158,6 +158,12 @@ There are exactly four terminal states, and only one of them means the review pa
 
 An unrecognised internal state maps to `INVALID_AUDIT`, never to anything that reads as approval.
 
+When a reviewer's reply could not be read, the result also carries `rc_diagnostics`, and each entry
+has a stable machine-readable `code` (`EMPTY_VERDICT_TEXT`, `MARKER_OUTSIDE_ANY_BLOCK`, …) next to
+its human-readable `why`. **Branch on `code`, never on `why`** — the codes are a contract and only
+ever gain new members; the sentences may be reworded or translated. The full list, and what each one
+tells you to fix, is in [docs/troubleshooting.md](docs/troubleshooting.md).
+
 ## Privacy, cost and what leaves your machine
 
 - **Your content goes to the model providers you have already configured** — Anthropic through
@@ -227,6 +233,12 @@ the compiled copy inside the panel is still up to date. See
 See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: a change to a gate needs a test that
 FAILS when the gate is removed. A test that passes with and without the code it claims to protect
 is not evidence.
+
+If you run a modified or separately deployed build of these components, the suites can be pointed at
+it (`DUAL_AUDIT_PANEL`, `DUAL_AUDIT_DRIVER`, `DUAL_AUDIT_WRAPPER`, …), and
+`scripts/check-live-parity.sh` compares two builds directly. That exists because a suite which can
+only reach the copy beside it cannot notice that the copy in use is different — which is how a guard
+came to live in one build and not the other, with both test runs green.
 
 Security issues: [SECURITY.md](SECURITY.md).
 

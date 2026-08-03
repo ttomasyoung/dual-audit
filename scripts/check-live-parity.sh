@@ -28,6 +28,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIVE_PANEL="${LIVE_PANEL:-$HOME/.claude/workflows/dual-audit-panel.js}"
 LIVE_DRIVER="${LIVE_DRIVER:-$HOME/.claude/workflows/dual-audit-run.js}"
 LIVE_WRAPPER="${LIVE_WRAPPER:-$HOME/bin/codex-audit}"
+# 🔴 The reviewer AGENT DEFINITION is part of the deployed surface, and it was left out of this
+#    comparison until it bit: the package definition gained a machine-readable timeout contract while
+#    the deployed one did not, so the gate that checks that contract could not even run against the
+#    build actually in use. Exactly the drift this script exists to catch, in the change that was
+#    about that drift.
+LIVE_AGENTDEF="${LIVE_AGENTDEF:-$HOME/.claude/agents/codex-audit-readonly.md}"
 # The environment-variable prefix and exit-code marker the other build uses. These are the renames the
 # normalisation below has to undo before the two sides can be compared at all.
 LIVE_ENVP="${LIVE_ENVP:-CODEX_AUDIT}"
@@ -36,10 +42,12 @@ LIVE_RC="${LIVE_RC:-CODEX_RC}"
 PKG_PANEL="$REPO/runtime/core/dual-audit-panel.js"
 PKG_DRIVER="$REPO/runtime/claude-controller/dual-audit-run.js"
 PKG_WRAPPER="$REPO/runtime/codex-auditor/dual-audit-codex"
+PKG_AGENTDEF="$REPO/runtime/codex-auditor/dual-audit-codex-readonly.md"
 
 fail=0
 missing=0
-for f in "$LIVE_PANEL" "$LIVE_DRIVER" "$LIVE_WRAPPER" "$PKG_PANEL" "$PKG_DRIVER" "$PKG_WRAPPER"; do
+for f in "$LIVE_PANEL" "$LIVE_DRIVER" "$LIVE_WRAPPER" "$PKG_PANEL" "$PKG_DRIVER" "$PKG_WRAPPER" \
+         "$LIVE_AGENTDEF" "$PKG_AGENTDEF"; do
   [ -f "$f" ] || { echo "  MISSING $f"; missing=1; }
 done
 [ "$missing" = 0 ] || { echo "check-live-parity: a file under comparison does not exist; nothing was checked"; exit 2; }
@@ -68,6 +76,7 @@ syms() {
 # and decided the other build is entitled to have it alone.
 #   <symbol>|<reason>
 KNOWN_OK=(
+  "lock_isolatable|the deployed build pins its lock to a fixed global path while this package derives it from the per-run directory. Moving the deployed one is NOT free: during the change a still-running old process holds the old path, so old and new would stop serialising against each other, and that lock is what protects a shared credential directory. Left as-is deliberately, to be changed at a moment when nothing is running — not silently as part of an unrelated edit"
   "_usage|prints the exact correct command line when an argument guard refuses; the other build grew a stricter argument gate and needed the hint, this one refuses without it"
 )
 known_reason() {
@@ -94,7 +103,48 @@ for pair in "panel:$PKG_PANEL:$LIVE_PANEL" "driver:$PKG_DRIVER:$LIVE_DRIVER" "wr
   [ -n "$accepted" ] && printf '%b\n' "$accepted"
 done
 
-echo "=== 2. The regression suites, run against the other build ==="
+echo "=== 2. Load-bearing VALUES, not just names ==="
+# WHY THIS SECTION EXISTS: section 1 compares symbol NAMES, so it proves no whole block lives on only
+# one side — and that is all it proves. Two differences slipped past it on the day it was written,
+# both plain variable assignments: one build pinned the reviewer binary while the other allowed an
+# override (so a test that meant to use a stub silently launched the real reviewer and spent tokens),
+# and the two lock paths pointed at different places (so the same test could not be isolated at all).
+# A green name-comparison read as "the builds agree" while neither of those was true.
+#
+# 🔴 Path-like values are compared by the PROPERTY THAT MATTERS, never by their literal text: the two
+#    builds are deliberately named differently, so a literal comparison would be noise on every line
+#    and would be switched off. "Is the lock inside the per-run directory" is the question; the string
+#    it is spelled with is not.
+num_default() { grep -oP "^_numenv\s+$2\s+\S+\s+\K[0-9]+" "$1" | head -1; }
+prop() { # prop <file> <property>
+  case "$2" in
+    lock_isolatable)       grep -q '^LOCK=.*RUNTIME_DIR' "$1" && echo yes || echo no ;;
+    # Match the ENV READ, not one particular expansion syntax. The first version looked for `:-` and
+    # reported "not overridable" for a build spelling it `${VAR-}` — a false divergence, which is the
+    # failure mode that gets a checker ignored faster than a missed one.
+    reviewer_overridable)  grep -qE '^REAL_CODEX="\$\{[A-Za-z_]*CODEX_BIN' "$1" && echo yes || echo no ;;
+    budget_slack)          grep -oP '^BUDGET_SLACK=\K[0-9]+' "$1" | head -1 ;;
+  esac
+}
+cmp_val() { # cmp_val <label> <pkg-value> <live-value> <why-it-matters>
+  if [ "$2" = "$3" ]; then echo "  OK   $1 = $2"
+  else
+    if r="$(known_reason "$1")"; then echo "  OK   $1 differs ($2 vs $3)"; echo "      accepted: $r"
+    else fail=1; echo "  DIVERGED $1: this package=$2  other build=$3 — $4"; fi
+  fi
+}
+for k in TIMEOUT KILL_AFTER LOCK_WAIT OUTER_BUDGET EXP_MARGIN STDIN_TIMEOUT MAX; do
+  cmp_val "default:$k" "$(num_default "$PKG_WRAPPER" "$k")" "$(num_default "$LIVE_WRAPPER" "$k")" \
+          "these numbers are the budget arithmetic; a build with different ones fails differently under the same caller"
+done
+cmp_val "BUDGET_SLACK" "$(prop "$PKG_WRAPPER" budget_slack)" "$(prop "$LIVE_WRAPPER" budget_slack)" \
+        "the room reserved for what happens after a timeout fires"
+cmp_val "lock_isolatable" "$(prop "$PKG_WRAPPER" lock_isolatable)" "$(prop "$LIVE_WRAPPER" lock_isolatable)" \
+        "a lock at a fixed global path cannot be isolated by a test, and makes unrelated runs on one machine contend"
+cmp_val "reviewer_overridable" "$(prop "$PKG_WRAPPER" reviewer_overridable)" "$(prop "$LIVE_WRAPPER" reviewer_overridable)" \
+        "without an override a test cannot substitute a stub, so any case that reaches the launch spends real credentials"
+
+echo "=== 3. The regression suites, run against the other build ==="
 run() { # run <label> <command...>
   local label="$1"; shift
   local out; out="$("$@" 2>&1)"; local rc=$?
@@ -105,6 +155,10 @@ run() { # run <label> <command...>
 run "panel"   env DUAL_AUDIT_PANEL="$LIVE_PANEL" node "$REPO/tests/test_panel.mjs"
 run "driver"  env DUAL_AUDIT_DRIVER="$LIVE_DRIVER" DUAL_AUDIT_RC_MARKER="__$LIVE_RC" node "$REPO/tests/test_driver.mjs"
 run "wrapper" env DUAL_AUDIT_WRAPPER="$LIVE_WRAPPER" DUAL_AUDIT_ENVP="$LIVE_ENVP" DUAL_AUDIT_RC_MARKER="$LIVE_RC" bash "$REPO/tests/test_wrapper.sh"
+# The two definitions are written for different audiences and deliberately differ in wording, so this
+# does NOT diff them. It runs the contract gate against the deployed pair, which is the part that has
+# to hold on both sides regardless of prose.
+run "agentdef" env DUAL_AUDIT_AGENTDEF="$LIVE_AGENTDEF" DUAL_AUDIT_WRAPPER="$LIVE_WRAPPER" bash "$REPO/tests/test_agentdef.sh"
 
 echo ""
 if [ "$fail" = 0 ]; then echo "=== PARITY OK ==="; else echo "=== PARITY FAILED — the two builds have diverged ==="; fi

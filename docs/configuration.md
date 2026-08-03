@@ -114,7 +114,8 @@ silently becomes the default can buy *looser* runtime parameters than the user a
 | `DUAL_AUDIT_TIMEOUT` | 540 | 86400 |
 | `DUAL_AUDIT_KILL_AFTER` | 30 | 3600 |
 | `DUAL_AUDIT_MAX_PAR` | 8 | 32 (clamps down rather than refusing: less concurrency is the safe direction) |
-| `DUAL_AUDIT_LOCK_WAIT` | 540 | 7200 |
+| `DUAL_AUDIT_LOCK_WAIT` | 20 | 7200 |
+| `DUAL_AUDIT_OUTER_BUDGET` | 600 | 604800 |
 | `DUAL_AUDIT_EXP_MARGIN` | 900 | 604800 |
 | `DUAL_AUDIT_STDIN_TIMEOUT` | 120 | 3600 |
 | `DUAL_AUDIT_MODE` | `isolated` | `isolated` or `serial` only |
@@ -122,20 +123,48 @@ silently becomes the default can buy *looser* runtime parameters than the user a
 | `DUAL_AUDIT_CODEX_BIN` | PATH lookup, then `~/.local/bin/codex` | |
 | `DUAL_AUDIT_RUNTIME_DIR` | `/tmp/dual-audit-<uid>` | must be absolute |
 | `DUAL_AUDIT_STATE_DIR` | `$XDG_STATE_HOME/dual-audit` | |
-
-`DUAL_AUDIT_TIMEOUT` and `DUAL_AUDIT_LOCK_WAIT` default to 540 because of the **caller's** ceiling,
-not because of anything about Codex. The reviewer agent runs the wrapper as a single shell command,
-and Claude Code cuts that command off after 600 seconds. A budget larger than the ceiling cannot be
-spent: the command is taken away, the agent is left with nothing to return, and the panel receives
-an empty verdict. It reports that honestly — an empty reviewer is `INFRASTRUCTURE_BLOCKED`, never an
-approval — but it looks identical to Codex being down, with no transcript to tell them apart.
-
-At 540 the wrapper reaches its own limit first, so you get `124` (timed out) or `99` (no slot) with
-a message, inside the ceiling. **Raise them only if your controller has no such ceiling**, and keep
-`LOCK_WAIT + TIMEOUT` under whatever it is: a review that waits for a slot spends the same budget as
-one that is running. For reference, a real review of two shell scripts at high reasoning effort took
-456 seconds — the room above that is smaller than it looks.
 | `DUAL_AUDIT_TELEMETRY` | **unset = telemetry OFF** | must be an absolute path to enable |
+
+### The caller's ceiling, and the three variables that share it
+
+`DUAL_AUDIT_OUTER_BUDGET` is the wall-clock ceiling **the caller enforces and the wrapper cannot
+raise**. It defaults to 600 because that is the ceiling of the tool this wrapper is most often
+invoked from: the reviewer agent runs the wrapper as a single shell command, and Claude Code cuts
+that command off after 600 seconds. When the outer limit fires first, this wrapper's own timeout and
+trap never run, stdout is empty, and **an audit that died is indistinguishable from one that found
+nothing** — the exact confusion this project exists to remove.
+
+So the wrapper models that ceiling explicitly. It records its entry time and, at each point where
+work is about to start, **measures** what is left:
+
+- more than `TIMEOUT` remains → nothing happens;
+- less than `TIMEOUT` remains → the reviewer timeout is tightened to fit, with a message, so the
+  wrapper still times out *first* and leaves `__DUAL_AUDIT_RC=124` behind;
+- nothing usable remains → **exit `97`**, refusing to start a review that would only be killed into
+  silence.
+
+⚠️ It measures rather than adding up the known stages. Summing was the first implementation and an
+independent review demonstrated it wrong: it omitted the stdin snapshot and the credential write, so
+the true worst case was 740 s against a 600 s ceiling while the check stayed quiet. A sum's failure
+direction is fixed and invisible — every stage added later makes it under-count, and nothing
+announces it.
+
+⚠️ Running from a terminal or a scheduler, where no such ceiling exists? Raise
+`DUAL_AUDIT_OUTER_BUDGET`. The wrapper deliberately **warns and tightens** rather than refusing
+long reviews outright, so a long legitimate review is never silently cut short — but with the
+default in place it will tighten toward 600.
+
+`DUAL_AUDIT_TIMEOUT` defaults to 540 for the same reason: at 540 the wrapper reaches its own limit
+first, so you get `124` (timed out) with a message, inside the ceiling. For reference, a real review
+of two shell scripts at high reasoning effort took 456 seconds — the room above that is smaller than
+it looks.
+
+`DUAL_AUDIT_LOCK_WAIT` defaults to **20, not 540**, and the asymmetry is deliberate. Queueing comes
+out of the same budget as reviewing: a run that waits nine minutes for the serial lock has nothing
+left to review with. The clamp above runs again after the lock is acquired and would correctly
+refuse with `97` — but a refusal delivered after spending 90% of the caller's budget on queueing is
+safe and useless. Twenty seconds covers a lock that was *briefly* held and gives up loudly on
+anything longer. Raise it only alongside `DUAL_AUDIT_OUTER_BUDGET`.
 
 Installation paths honour `HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR` and
 `DUAL_AUDIT_BIN_DIR`, which is what makes an install into a temporary HOME possible for testing.
@@ -150,3 +179,26 @@ would reveal when it was issued.
 Two caveats if you analyse it: an exit category of `timeout_like` is **inferred**, since the
 reviewer can return that code itself and it also arises from an external kill; and telemetry is
 best-effort, so it is evidence about trends, not proof that a run happened.
+
+### Pointing the test suites at another build
+
+Read only by `tests/`. They exist so that **one** suite can be run against a separately deployed
+copy of the same component — an installed build, a fork, a vendored copy — instead of only against
+the file sitting next to it in this repository.
+
+| Variable | Suite | What it replaces |
+|---|---|---|
+| `DUAL_AUDIT_PANEL` | `test_panel.mjs` | Path to the panel module under test |
+| `DUAL_AUDIT_DRIVER` | `test_driver.mjs` | Path to the driver module under test |
+| `DUAL_AUDIT_WRAPPER` | `test_wrapper.sh` | Path to the reviewer wrapper under test |
+| `DUAL_AUDIT_ENVP` | `test_wrapper.sh` | The wrapper's environment-variable prefix, when the other build uses different names |
+| `DUAL_AUDIT_RC_MARKER` | `test_driver.mjs`, `test_wrapper.sh` | The exit-code marker string, when the other build uses a different one |
+
+Why this is here rather than left as a private detail: a suite that can only reach the copy beside
+it **cannot detect that the copy actually in use is different**. That is not hypothetical — it is
+how a budget guard came to exist in one build of this wrapper and not the other, with a full green
+test run on each. Related: `scripts/check-live-parity.sh` compares two builds directly.
+
+A case that cannot be constructed against the build being tested must report **SKIP**, not pass.
+A skipped case and a passed case are different facts, and a suite that blurs them is back to
+reporting the thing this project exists to prevent.

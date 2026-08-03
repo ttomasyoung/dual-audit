@@ -46,6 +46,25 @@ block itself breaks: a loud failure instead of a silent one.
   opening and closing delimiter — they must match.
 - Keep `--skip-git-repo-check` and `--sandbox read-only`.
 
+<!-- dual-audit:bash-timeout-contract required_ms=580000 tool_default_ms=120000 tool_max_ms=600000 -->
+
+**Give that Bash call the longest timeout your caller allows, explicitly.** In Claude Code that is
+`timeout: 580000` — the tool's own default is **120000 ms, two minutes**, and a review takes several.
+A call made without the parameter is killed at two minutes with exit 143 and an empty stdout, no
+matter how long anyone was willing to wait. 580000 sits just under the tool's 600000 maximum and just
+above the wrapper's own `TIMEOUT + KILL_AFTER` (570 s), so the wrapper reaches its limit first and
+fails **loudly**, with `__DUAL_AUDIT_RC=124` inside the block, instead of being killed into silence.
+
+⚠️ Set it even if you are told the ceiling is fixed. This was observed in a single panel: the
+round-1 seat passed the parameter and returned a full verdict in over nine minutes; the round-2 seat
+did not, was killed at two minutes, retried six times, and the panel lost the seat. Same
+instructions, opposite outcomes. And note what the failure looks like from outside — no verdict,
+which is indistinguishable from a reviewer that read everything and had nothing to say.
+
+⚠️ **Killed at exactly two minutes? Do not retry the same command.** Retrying without the parameter
+reproduces the same kill and spends tokens each time. Add the timeout and run once more; if that also
+fails, say so in one line and return what the wrapper actually printed.
+
 Then return the command's stdout EXACTLY as it came out. No preface, no commentary, no summary of
 your own.
 

@@ -196,6 +196,10 @@ const RC_IN_BLOCK_RE = /^[ \t]*__DUAL_AUDIT_RC=(-?\d+)[ \t]*$/gm
 // Same block pattern the panel uses: line-anchored, with END alone on its own line
 // (so the phrase "end-to-end" in prose is not a terminator).
 const BLOCK_RE = /^[ \t]*VERDICT:[\s\S]*?^[ \t]*END[ \t]*$/gm
+// The wrapper writes this the instant before it hands control to the reviewer, so that a run
+// killed part-way is DISTINGUISHABLE from one that never started. Without it both produced an
+// empty stdout, and no amount of care downstream can separate two identical signals.
+const LAUNCHED_RE = /^[ \t]*__DUAL_AUDIT_LAUNCHED=/m
 
 // Take the LAST VERDICT..END block (the panel picks the same one) and require
 // EXACTLY ONE marker inside it. Zero means the marker was dropped or the wrapper ran
@@ -377,6 +381,9 @@ while (calls < MAX_PANEL_CALLS) {
     const inLast = nBlocks ? countMarkers(blocks[nBlocks - 1]) : 0
     const inAnyBlock = blocks.reduce((n, b) => n + countMarkers(b), 0)
     const anywhere = /__DUAL_AUDIT_RC=/.test(String(verdictText))
+    // No `g` flag on LAUNCHED_RE, deliberately: a /g/ regex carries lastIndex between .test() calls
+    // and would answer differently on the second identical question.
+    const launched = LAUNCHED_RE.test(String(verdictText))
     // 🔴 `code` is the STABLE machine-readable identifier; `why` is the human sentence.
     //    They are separate because asserting on prose is a known weak-assertion trap: reword the
     //    sentence and the test fails while the behaviour is unchanged, and translate it and every
@@ -386,7 +393,9 @@ while (calls < MAX_PANEL_CALLS) {
     const code = !verdictText
       ? 'EMPTY_VERDICT_TEXT'
       : nBlocks === 0
-        ? (anywhere ? 'MARKER_WITHOUT_BLOCK' : 'NO_BLOCK_NO_MARKER')
+        ? (anywhere ? 'MARKER_WITHOUT_BLOCK'
+          : launched ? 'LAUNCHED_BUT_NO_VERDICT'
+          : 'NO_BLOCK_NO_MARKER')
       : inLast > 1 ? 'MARKER_AMBIGUOUS_IN_LAST_BLOCK'
       : inLast === 1 ? 'MARKER_UNREADABLE_INTERNAL_INCONSISTENCY'
       : inAnyBlock > 0 ? 'MARKER_IN_EARLIER_BLOCK'
@@ -397,7 +406,18 @@ while (calls < MAX_PANEL_CALLS) {
       : nBlocks === 0
         ? (anywhere
           ? 'a marker is present but there is no VERDICT..END block — the reviewer produced no verdict (the marker is the wrapper\'s fallback append)'
-          : 'no VERDICT..END block and no marker — no verdict, and the wrapper did not run with --emit-rc')
+          : launched
+          ? 'the wrapper announced the launch and then nothing came back — the reviewer WAS started and did not finish. '
+            + 'It was killed from outside (a caller wall-clock ceiling shorter than the reviewer needs is the common cause; '
+            + 'set DUAL_AUDIT_OUTER_BUDGET to the real ceiling, and give the command itself the longest timeout the caller allows). '
+            + 'This is infrastructure, NOT a review that found nothing'
+          // ⚠️ Three causes, not one. An earlier version named only the last, which a reviewer showed
+          //    is false for the first: a run killed while WAITING for a slot or the serial lock has
+          //    legitimately announced nothing yet, and sending the reader after --emit-rc points them
+          //    at a flag that was set correctly.
+          : 'no VERDICT..END block and no marker at all — the run never got as far as launching a reviewer. '
+            + 'Either it was killed while still queueing for a slot or the serial lock, or it was refused '
+            + 'during setup (check stderr and the wrapper exit code), or the wrapper did not run with --emit-rc')
       : inLast > 1
         ? `${inLast} markers inside the last block — ambiguous, refused fail-closed`
       : inLast === 1

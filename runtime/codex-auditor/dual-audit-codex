@@ -158,7 +158,12 @@ _numenv TIMEOUT       DUAL_AUDIT_TIMEOUT       540   86400
 # about the token still being valid during a forced kill.
 _numenv KILL_AFTER    DUAL_AUDIT_KILL_AFTER    30    3600
 _numenv MAX           DUAL_AUDIT_MAX_PAR       8     32     1     # MAX is clamped when too large (less concurrency is the safe direction); malformed values still refuse
-_numenv LOCK_WAIT     DUAL_AUDIT_LOCK_WAIT     540   7200         # also feeds the admission threshold, on the same basis as TIMEOUT and EXP_MARGIN
+_numenv LOCK_WAIT     DUAL_AUDIT_LOCK_WAIT     20    7200         # also feeds the admission threshold, on the same basis as TIMEOUT and EXP_MARGIN
+# 🔴 20, not 540. With OUTER_BUDGET=600 a 540 s lock wait leaves nothing to review with: the
+#    post-lock clamp would correctly refuse with 97, but only after burning 90% of the caller's
+#    ceiling on queueing. Waiting most of a budget in order to be told there is none left is
+#    safe and useless. A caller with no ceiling can raise it; the default belongs to the caller
+#    that has one.
 _numenv EXP_MARGIN    DUAL_AUDIT_EXP_MARGIN    900   604800
 _numenv STDIN_TIMEOUT DUAL_AUDIT_STDIN_TIMEOUT 120   3600
 
@@ -485,6 +490,36 @@ _emit_rc_inject(){   # $1=rc; stdin=reviewer stdout; stdout=the same text with t
   '
 }
 
+# ---- The launch marker: makes "killed part-way" distinguishable from "never ran" ----
+#
+# 🔴 THE HOLE THIS CLOSES. Until this existed, the wrapper wrote NOTHING to stdout until the
+#    reviewer had already returned — the injected block is the first byte. So a reviewer that was
+#    killed mid-review and a reviewer that was never invoked produced BYTE-IDENTICAL stdout: empty.
+#    That is this project's own thesis turned on itself, and it was not hypothetical. Observed: a
+#    caller enforced a 120 s ceiling nobody had declared; the reviewer started, read the sources,
+#    reasoned for two minutes and was killed. Everything it had done went to stderr, which no caller
+#    reads; stdout stayed empty. The panel's honest reading of an empty stdout is "reviewer
+#    unavailable" — but only if it is READ that way, and the seat, seeing nothing, simply reran the
+#    same doomed command six times. Nothing anywhere could tell "died" from "had nothing to say".
+#
+# So: one line, written the instant before the reviewer is handed control. It costs nothing, it
+# cannot fail, and it converts the ambiguity into three DISTINGUISHABLE states for the driver:
+#   marker + a complete VERDICT..END block  -> normal
+#   marker, no block                        -> LAUNCHED AND KILLED. Infrastructure, never a verdict.
+#   no marker at all                        -> never got as far as launching (refused, setup failed)
+#
+# ⚠️ Only under --emit-rc, and that is NOT the mistake this file has made before. The budget clamp
+#    had to cover every path because it is a SAFETY guard and a guard present on one of two paths is
+#    absent. This is an OUTPUT CONTRACT, and the opposite rule applies: --emit-rc is precisely the
+#    flag by which a caller opts into having its stdout rewritten, and this wrapper is shared
+#    infrastructure whose other callers parse raw reviewer output. Adding an unconditional line to
+#    their stdout would break them. Same shape, opposite direction — check which kind you are
+#    holding before moving either.
+_announce_launch(){
+  [ "$EMIT_RC" = 1 ] || return 0
+  printf '__DUAL_AUDIT_LAUNCHED=%s\n' "$TIMEOUT"
+}
+
 # ---- Serial fallback: one shared home, serialised by flock. It does not exec, so the
 # cleanup trap still runs ----
 # Isolation level, chosen deliberately: flock serialises runs (only one at a time) and each
@@ -505,6 +540,13 @@ run_serial(){
   flock -w "$LOCK_WAIT" 200 || { TM_SERIAL_WAIT_MS=$(_dur_ms "$_t_ser0"); TM_CAT_OVERRIDE=serial_lock_timeout
     echo "dual-audit-codex(serial): lock not acquired within ${LOCK_WAIT}s; 99" >&2; exit 99; }
   TM_SERIAL_WAIT_MS=$(_dur_ms "$_t_ser0")     # record the wait even on success (the failure path recorded it above)
+  # 🔴 The wait above can be long — it is bounded by LOCK_WAIT, not by anything the caller granted.
+  #    Without this call the budget was last measured BEFORE the wait, so a run could sit here for
+  #    most of the caller's ceiling and then start a full-length reviewer against what was left;
+  #    the caller kills it first, the trap never runs, and stdout comes back empty. Measured by an
+  #    independent review on BOTH builds. Placed here rather than just before the launch so that a
+  #    doomed run is refused BEFORE it writes a credential.
+  _clamp_timeout post-lock
   mkdir -p "$AUDIT_HOME" "$FAKE_HOME" "$AUDIT_CWD" || { echo "dual-audit-codex(serial): could not create directories" >&2; exit 5; }
   # Serial mode is the ONE path that writes a credential to a long-lived location, so it gets the
   # same guard the per-run runtime directory already had. `mkdir -p` follows a symlinked directory
@@ -538,6 +580,11 @@ EOF
   # exec_ms covers the reviewer call only, not lock acquisition, setup or cleanup
   local _rc; TM_EXEC_T0=$(_mono_ms)
   if [ -n "$STDIN_SNAP" ]; then
+    # Both dispatch paths announce, or the marker's absence would mean two different things —
+    # "never launched" on one path and "serial mode" on the other — and a signal with two
+    # meanings is not a signal. Placed inside the brief guard: a run refused for having no
+    # brief genuinely never launched, and must not claim it did.
+    _announce_launch
     if [ "$EMIT_RC" = 1 ]; then
       # rc MUST be captured BEFORE the pipe: once `| _emit_rc_inject` is appended, $? is
       #   awk's exit code, not the reviewer's.
@@ -686,7 +733,14 @@ for a in "$@"; do NEWARGS+=("$a"); if [ "$inserted" = 0 ] && [ "$has_eph" = 0 ] 
 
 # A neutral private working directory cuts off directory-based configuration discovery; no exec, so the trap can clean up; timeout rather than killing by name; and 9>&- keeps the slot descriptor away from the reviewer subtree so an orphan cannot hold a slot
 cd "$CWD" || { echo "dual-audit-codex: could not cd into the private working directory" >&2; exit 7; }
+# 🔴 OUTSIDE the --emit-rc branch, and before it. The first version of this call sat INSIDE that
+#    branch, and --emit-rc defaults to OFF — so the path most callers take had no re-measurement
+#    after up to LOCK_WAIT seconds of queueing, which is the whole reason the call exists. An
+#    independent review measured it: the default path launched with a 20 s timeout while 12 s of
+#    budget remained. A guard placed in one of two branches reads as present and is not.
+_clamp_timeout isolated   # again after the slot was won, so QUEUEING time counts against the budget
 TM_EXEC_T0=$(_mono_ms)   # exec_ms covers the reviewer call only, not slot waiting, setup or cleanup
+_announce_launch         # see the definition: this is the ONLY thing on stdout before the reviewer runs
 if [ "$EMIT_RC" = 1 ]; then
   # ---- --emit-rc: write the real exit code INSIDE the verdict block, not after it ----
   # The exit code otherwise exists only as a process status (the `exit "$RC"` below), and a
@@ -698,7 +752,6 @@ if [ "$EMIT_RC" = 1 ]; then
   # because the caller waits for completion anyway.
   # Defaulting this OFF is load-bearing: this wrapper is shared infrastructure used by other
   # callers, and defaulting it on would rewrite every caller's stdout.
-  _clamp_timeout isolated   # again after the slot was won, so time spent QUEUEING counts against the budget too
   _EMIT_OUT=$(timeout -k "$KILL_AFTER" "$TIMEOUT" \
     env HOME="$EHOME" CODEX_HOME="$RUN_ROOT" "$REAL_CODEX" ${NEWARGS+"${NEWARGS[@]}"} < "$RUN_ROOT/brief.md" 9>&-)
   RC=$?                  # MUST be captured before the pipe: once `| _emit_rc_inject` is added, $? is awk exit code

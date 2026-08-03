@@ -31,14 +31,46 @@ guard was doing the work. Replace it with a mutant that does not crash.
 bash tests/run-all.sh
 ```
 
-No paid model is ever called: the reviewers are stubbed, and the wrapper tests exercise refusal
-paths only. Everything happens in throwaway directories.
+No paid model is ever called: the reviewers are stubbed — including in the mutation cases, where a
+local stub stands in for the reviewer binary — and everything happens in throwaway directories.
+
+A case that cannot be constructed against the build under test must report **SKIP**, not pass. A
+skipped case and a passed case are different facts.
 
 Before proposing a release:
 
 ```bash
 bash scripts/sanitize-scan.sh
 ```
+
+## This package is derived from a running build, not a mirror of one
+
+Worth stating plainly, because it changes what "in sync" can mean.
+
+The protocol here was extracted from a working private setup, and that setup **kept running** —
+which means there are two builds of the same components, and they are not interchangeable. The
+package carries a de-domained profile block where the running one carries real project rules; some
+paths and defaults differ for stated reasons. So `diff` is not the right tool: it reports
+differences that are supposed to be there, and a maintainer who learns to skim past those will skim
+past the one that is not.
+
+What happened when nobody was checking is the reason 1.0.0 exists: the two drifted **in both
+directions** — the package had a terminal-state layer the running build lacked, the running build
+had a budget guard the package lacked. Neither was a superset, so "just copy the newer one" would
+have deleted a real guard. Both suites were green throughout, because each suite could only reach
+the copy sitting beside it.
+
+```bash
+bash scripts/check-live-parity.sh          # compare, then run all suites against BOTH builds
+```
+
+It compares the set of functions and guards after normalising known renames, and the values that
+carry weight — numeric defaults, whether the lock can be isolated, whether the reviewer binary can
+be overridden. **Accepted differences must be listed with a written reason, and every reason prints
+on every run**, so an accepted difference cannot decay into a forgotten one.
+
+`scripts/sync-from-live.sh` is the one supported direction of copying, with the de-domaining step
+attached so a sync cannot smuggle a machine-local project name into the package.
 
 ## Before publishing anything
 
