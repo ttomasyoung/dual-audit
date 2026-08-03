@@ -39,7 +39,10 @@ quietly reads as approval.
 - **It is bounded.** At most three rounds, with a hard ceiling on reviewer calls. It converges,
   preserves a minority position, or hands the decision back to you.
 - **Failures are loud.** Empty output, a timeout, a nonzero exit, a malformed or misidentified
-  verdict — each is a distinct, named failure. None of them can become an approval.
+  verdict — each is a distinct, named failure. None of them can become an approval. That includes
+  the hardest one to see: a reviewer **killed part-way**. The wrapper announces the launch before
+  handing over, so a review that started and died reports `LAUNCHED_BUT_NO_VERDICT` instead of the
+  empty output a review that never started would produce.
 
 The protocol is controller-neutral by design. This release uses Claude Code as the controller and
 Codex as the independent reviewer; the review state and verdict contract do not assume that.
@@ -159,7 +162,7 @@ There are exactly four terminal states, and only one of them means the review pa
 An unrecognised internal state maps to `INVALID_AUDIT`, never to anything that reads as approval.
 
 When a reviewer's reply could not be read, the result also carries `rc_diagnostics`, and each entry
-has a stable machine-readable `code` (`EMPTY_VERDICT_TEXT`, `MARKER_OUTSIDE_ANY_BLOCK`, …) next to
+has a stable machine-readable `code` (`EMPTY_VERDICT_TEXT`, `LAUNCHED_BUT_NO_VERDICT`, …) next to
 its human-readable `why`. **Branch on `code`, never on `why`** — the codes are a contract and only
 ever gain new members; the sentences may be reworded or translated. The full list, and what each one
 tells you to fix, is in [docs/troubleshooting.md](docs/troubleshooting.md).
@@ -209,7 +212,14 @@ Stated plainly, because a review tool that oversells itself is worse than none:
   readily than they act, so the realistic outcome is a file kept that could have been removed; the
   reverse needs the replacement to land inside a window of milliseconds. Do not run two of them at
   once, and do not edit the installed files while either is running.
-- **Linux only in this release.** macOS and Windows are not supported yet.
+- **A review needs several minutes of wall clock, and your controller may not give it that.** If
+  whatever runs the wrapper enforces a shorter ceiling, tell the wrapper with
+  `DUAL_AUDIT_OUTER_BUDGET` so it tightens its own timeout and fails loudly inside your limit; give
+  the command itself the longest timeout your tool allows. Get this wrong and the reviewer is killed
+  mid-review — reported as `LAUNCHED_BUT_NO_VERDICT`, never as an approval, but the review is still
+  lost. This is the failure that most often looks like nothing happening.
+- **Linux only in this release.** macOS and Windows are not supported yet. Verified on Ubuntu 24.04
+  with Node 22; CI also exercises Node 18 and 20.
 
 ## Troubleshooting
 
