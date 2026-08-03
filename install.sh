@@ -193,6 +193,9 @@ would_match() { # would_match <rel> <destination>
       subst "$tmp" __DUAL_AUDIT_RUN_PATH__ "$RUN_DST"
       subst "$tmp" __DUAL_AUDIT_PROFILE_PATH__ "$PROFILE" ;;
     skills/light-audit/SKILL.md)
+      # This lane now invokes the panel itself (at mode: quick), so it needs the run path too. It
+      # did not before, when it dispatched a single reviewer with a hand-written brief.
+      subst "$tmp" __DUAL_AUDIT_RUN_PATH__ "$RUN_DST"
       subst "$tmp" __DUAL_AUDIT_PROFILE_PATH__ "$PROFILE" ;;
   esac
   a="$(sha "$tmp")"; b="$(sha "$dst")"; rm -f "$tmp"
@@ -387,6 +390,7 @@ for _i in "${!PLAN_REL[@]}"; do
       subst "$dst" __DUAL_AUDIT_RUN_PATH__ "$RUN_DST"
       subst "$dst" __DUAL_AUDIT_PROFILE_PATH__ "$PROFILE" ;;
     skills/light-audit/SKILL.md)
+      subst "$dst" __DUAL_AUDIT_RUN_PATH__ "$RUN_DST"
       subst "$dst" __DUAL_AUDIT_PROFILE_PATH__ "$PROFILE" ;;
   esac
   chmod "$mode" "$dst" || fail "could not set the mode on $dst"
