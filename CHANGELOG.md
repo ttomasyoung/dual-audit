@@ -5,11 +5,177 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-08-03
+
+The first two releases published a snapshot. This one publishes what is actually running.
+
+`0.1.0` was an extraction — the protocol lifted out of a working private setup, generalised and
+re-verified. What that framing quietly assumed is that the private setup would hold still. It did
+not. Over the following week it was put through the panel it implements, repeatedly, and it did not
+come out clean: the panel found fail-open defects in its own core, and then found defects in the
+fixes for those defects. None of that reached the package.
+
+So the two builds drifted — and, importantly, **in both directions**. The released build had a
+terminal-state layer the running one lacked. The running one had a budget guard the released one
+lacked. Neither was a superset of the other, which is the state where "just copy the newer one"
+silently deletes a guard. That is not a packaging inconvenience; for a tool whose entire claim is
+*a dead reviewer and a satisfied reviewer emit the same text*, it is the same failure one level up.
+
+This release is the two things that follow from that:
+
+1. **The package carries the running implementation**, not a snapshot of an earlier one.
+2. **Divergence is checkable by a script rather than by memory** — `scripts/check-live-parity.sh`.
+   "Keep the two in sync" is an instruction addressed to a human, and the failure being prevented
+   here is exactly a human not remembering.
+
+It is `1.0.0` and not `0.2.0` because the guarantees changed, not only the code. Inputs the earlier
+releases accepted are now refused — a misspelt risk level, a mode name that does not exist, a
+reviewer whose output arrived without its exit code, a brief whose hash matched while its content
+did not. Every one of those used to be a pass. A refusal where there used to be a pass is a
+breaking change for anyone who built on the old behaviour, and it should cost a major version.
+
 ### Added
 
 - `WHY.md` and `WHY.zh-CN.md` — the author's account of what went wrong before this existed, and
   why the answer turned out not to be "find a smarter model". Linked from both READMEs, because
   most people reading a README first want to know why the thing was built at all.
+- **Named seat roles, derived from one definition.** The Claude side dispatches a run seat (`D1D2`)
+  and a logic seat (`ABCL`) when the change is code-relevant, and the logic seat alone when it is
+  not. Previously the seat list, the run-seat classifier in `evaluateConvergence`, and the shape
+  check that rebuilds seats from `prior_state` each carried their own copy of that knowledge and
+  agreed only by convention — renaming a lens would have broken the classifier silently.
+- **A time box as a first-class brief field** (`TIME_BOX_MIN`, default 8 minutes) rather than a
+  sentence in prose. ⚠️ Recorded honestly: prose in a brief is *advice to a model*, and a run given
+  a three-minute box was measured taking 5.2. The enforcing ceiling is the wrapper's budget clamp,
+  not this field; the field exists so the two are at least stated in the same place.
+- **`scripts/check-live-parity.sh`** — compares an installed build against the package: the set of
+  functions and guards after normalising known renames, plus the *values* that carry weight
+  (numeric defaults, whether the lock is isolatable, whether the reviewer binary can be overridden).
+  Accepted differences must be listed with a written reason, and the reasons print on every run,
+  so an accepted difference cannot quietly become a forgotten one.
+- **`scripts/sync-from-live.sh`** — the one supported direction of copying, with the de-domaining
+  step attached, so syncing cannot smuggle a machine-local project name into the package.
+- **A launch marker on stdout, so a reviewer killed part-way stops looking like one that never
+  ran.** Until now the wrapper wrote nothing to stdout until the reviewer had already returned — the
+  injected verdict block was the first byte. A review killed mid-flight and a review never invoked
+  therefore produced byte-identical output: **empty**. That is this project's own thesis turned on
+  itself, and it was not theoretical: a caller enforced a wall-clock ceiling nobody had declared to
+  the wrapper, the reviewer started, read its sources, reasoned for two minutes and was killed;
+  everything it had done went to stderr, which no caller reads, and stdout stayed empty. The seat,
+  seeing nothing, reran the same doomed command six times.
+  The wrapper now writes one line the instant before it hands control over, giving three
+  distinguishable states — marker plus a complete block (normal), marker with no block (**started
+  and killed**, reported as `LAUNCHED_BUT_NO_VERDICT` and always infrastructure), no marker at all
+  (never got as far as launching). ⚠️ Emitted only under `--emit-rc`, which is the flag by which a
+  caller opts into having its stdout rewritten; other callers parse raw reviewer output and are
+  untouched. **The marker does not save the review** — it makes the loss visible, which is the
+  difference between losing a reviewer and not knowing you lost one.
+- **Machine-readable diagnostic codes** on every reviewer-parse failure: `EMPTY_VERDICT_TEXT`,
+  `NO_MARKER_ANYWHERE`, `MARKER_WITHOUT_BLOCK`, `MARKER_OUTSIDE_ANY_BLOCK`,
+  `MARKER_IN_EARLIER_BLOCK`, `MARKER_AMBIGUOUS_IN_LAST_BLOCK`, `NO_BLOCK_NO_MARKER`,
+  `MARKER_UNREADABLE_INTERNAL_INCONSISTENCY`. These are a stable contract: assertions and callers
+  may branch on them. They exist because the tests used to assert against the English sentence
+  beside the code, which meant rewording a message broke a test that was testing nothing.
+- **The test suites can be pointed at an external build** (`DUAL_AUDIT_PANEL`, `DUAL_AUDIT_DRIVER`,
+  `DUAL_AUDIT_WRAPPER`, `DUAL_AUDIT_ENVP`, `DUAL_AUDIT_RC_MARKER`). A suite that can only test the
+  copy in its own repository cannot detect that the copy in use is different, which is the whole
+  problem above.
+
+### Changed
+
+- **Project-specific rules moved out of the panel and into a machine-local profile.** The panel body
+  is domain-neutral: no project names, no project paths, no domain thresholds. A profile injects
+  them only when the caller names that project, and the profile never enters a repository. A shared
+  review tool that names one user's projects steers every other user's audit toward that shape.
+- **`kind: 'biology'` is now `kind: 'claim'`.** The old name still works — callers and stored
+  `prior_state` are unaffected — but the concept was never biology-specific: it is "this change is
+  a claim about the world, not about code".
+- **`LOCK_WAIT` default 540 s → 20 s.** Against a 600 s caller ceiling, a 540 s lock wait leaves
+  nothing to review with. The post-lock clamp would correctly refuse — but only after spending 90%
+  of the caller's budget queueing to be told there is none left. Safe, and useless. A caller with
+  no ceiling can raise it; the default belongs to the caller that has one.
+- **`MAX_PAR` default 12 → 8**, on measurement rather than opinion: across 548 recorded runs the
+  highest slot ever taken was 5 and nothing ever queued.
+- **`risk` and `mode` are validated against a closed set.** A misspelt risk (`hgh`) used to fall
+  through to `normal`, so a task that should have had the strictest treatment got the default one.
+  `mode: 'quick2'` used to fall through to `adaptive`, i.e. a caller asking for *one* round silently
+  got three. Both now refuse.
+
+### Fixed
+
+- **The brief hash was forgeable, in six distinct ways.** It is what proves round 2 is examining the
+  same submission round 1 saw, so a collision is not cosmetic. Every value is now emitted as a
+  `[typeTag, payload]` tuple, because an untagged encoding let a literal string impersonate a
+  structure. Alongside that: `JSON.stringify` collapses `NaN`, `Infinity` and `-Infinity` all to
+  `null`, so three different briefs hashed identically; functions bound their name and not their
+  source, so two different bodies with the same name hashed identically; `Symbol.toPrimitive` and
+  `toString` decide what the brief *renders*, so two objects rendering `CONTRACT-A` and
+  `CONTRACT-B` hashed identically; inherited and non-enumerable properties were not walked, though
+  the execution logic reads arguments by plain property access and therefore sees them; and a plain
+  `*` on 32-bit hash state overflows 2^53 and drops the low bits, losing most of the real entropy
+  (now `Math.imul`).
+- **A real blocking finding could be filtered away and the panel would then declare convergence** —
+  probed, not hypothetical. The route was a heuristic that demoted a P0 whose text did not look
+  specific enough; the demotion left the filtered blocker list empty, and an empty list is what
+  `approvesFinal` reads as "nothing blocking". The counter-example that killed the heuristic had a
+  file, a symbol and a full damage chain and still failed it. Qualification, demotion and the
+  per-auditor count are now explicit and logged (`qualifyP0s`, `demotedLog`,
+  `MAX_BLOCKING_P0_PER_AUDITOR`), and a demoted finding is carried into the next round rather than
+  disappearing. The rule this leaves behind: when a filter's failure direction is *dropping a real
+  blocker*, no amount of noise it removes pays for that.
+- **"The reviewer did not answer" was decidable in more ways than the check knew about.** Line
+  terminators are normalised at one entry point sharing one table with the line scanner (a second
+  table inside the scanner is exactly how the two diverged before); VT/FF/FS/GS/RS/US render as
+  line breaks and now parse as ones; zero-width and format characters do not `trim()` away, so
+  `"\u200b".trim()` returns the zero-width space, not `""`; a bare combining mark carries no content while an attached one is
+  part of a character; colons are recognised in their compatibility forms; and CJK is matched
+  character-by-character because it has no inter-word spaces. The enumerated phrase list is gone —
+  it was broken in four consecutive reviews — replaced by a structural test with a stated honest
+  boundary: it catches empty and *explicit* non-answers, and verbose emptiness is caught instead by
+  requiring a flip to stay stable across rounds.
+- **`foldKey` and `normForDedup` disagreed**, so two spellings of the same finding could be folded
+  by one and kept distinct by the other.
+- **The wrapper stopped re-measuring its budget at the two points where waiting happens.** The
+  isolated-path clamp sat *inside* the `if [ "$EMIT_RC" = 1 ]` branch while `--emit-rc` defaults
+  off, so the path most callers take had no re-measurement after up to `LOCK_WAIT` seconds of
+  queueing — measured launching with a 20 s timeout while 12 s of budget remained. A guard placed
+  in one of two branches reads as present and is not. Separately, `run_serial` never re-measured
+  between `flock` returning and the launch; the clamp is now immediately after the wait and
+  *before* the credential write, so a doomed run leaves no credential behind.
+- **The arithmetic invariant that was supposed to prove the timeout chain fits inside the caller's
+  ceiling omitted `LOCK_WAIT`**, so the shipped defaults passed it while exceeding the ceiling. The
+  general form of that mistake is worth naming: a static sum under-counts every time a stage is
+  added, and it does so silently and in the unsafe direction.
+- **The reviewer agent was never told to raise its own command timeout**, so whether a review could
+  finish at all was left to the model happening to set it. In Claude Code the Bash tool defaults to
+  **120 s** and a review takes several minutes; 600 s is the *maximum you must ask for*, not what
+  silence gets you. Observed inside one panel: the round-1 seat set it and returned a full verdict in
+  over nine minutes, while the round-2 seat did not, was killed at two minutes with exit 143 and an
+  empty stdout, retried six times, and the panel lost that seat. Same brief, same agent definition,
+  opposite outcomes. The definition now states the value, explains that the default cannot work, and
+  says not to retry the identical command after a two-minute kill. The definition now also carries a
+  machine-readable timeout contract checked by `tests/test_agentdef.sh` against the wrapper's real
+  defaults, so raising the wrapper's own timeout past what seats are told to ask for turns the
+  arithmetic red instead of leaving a stale instruction nobody rechecks. ⚠️ The first version of that
+  check merely grepped for the two numbers; an independent review defeated it in one move by
+  rewriting the paragraph to *withdraw* the requirement while keeping both figures, and pointed out
+  that deleting the operative sentence alone already left them in the file. That exact rewrite is now
+  a permanent negative fixture. Filed as `Fixed` and not as a
+  documentation tidy-up because the observable failure — no verdict — is exactly what a reviewer that
+  read everything and found nothing to say produces.
+- **Cases that must reach a reviewer launch now SKIP where they cannot be built, instead of failing.**
+  Strengthening the mutation checks (above) had an unlooked-for consequence: on a machine with no
+  Codex credentials — CI, a fresh clone — the wrapper refuses during bootstrap long before any guard
+  under test, so six cases went red for a reason that is not a defect. They now probe once whether a
+  launch is reachable and report `SKIP` when it is not. ⚠️ Decided by probing, never by an
+  environment switch: a switch would also silence a real regression on a machine that does have
+  credentials. Verified in both directions — with credentials the group runs with **zero** skips;
+  without them the whole suite is green with the skips reported.
+- **The wrapper's own test suite launched the real reviewer**, with real credentials, while the
+  file's header stated that no reviewer is ever launched and no tokens are ever spent. A stub is
+  now exported for the whole file, the reviewer binary is overridable in both builds (it had been
+  hardcoded in one), and the launch count is itself the assertion: zero for every unmutated case,
+  exactly one for the mutant — which is also what proves the mutation test has teeth.
 
 ## [0.1.1] — 2026-07-28
 

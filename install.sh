@@ -24,7 +24,7 @@
 # is what makes an install into a temporary HOME possible for testing.
 set -uo pipefail
 
-VERSION="0.1.0"
+VERSION="1.0.0"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DRY=0; FORCE=0

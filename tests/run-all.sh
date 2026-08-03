@@ -53,6 +53,7 @@ for f in install.sh uninstall.sh runtime/core/dual-audit runtime/codex-auditor/d
          runtime/codex-auditor/dual-audit-lint scripts/sanitize-scan.sh tests/*.sh; do
   bash -n "$f" || { echo "  FAIL bash -n $f"; static_rc=1; }
 done
+
 if [ "$static_rc" -eq 0 ]; then echo "  PASS all scripts parse"; else failed+=("static checks"); fi
 
 run "panel protocol"        node tests/test_panel.mjs
@@ -62,6 +63,7 @@ run "reviewer wrapper"      bash tests/test_wrapper.sh
 run "install and removal"   bash tests/test_install.sh
 run "bypass linter"         bash tests/test_lint.sh
 run "sanitisation scanner"  bash tests/test_sanitize.sh
+run "agent definition contract" bash tests/test_agentdef.sh
 
 echo ""
 echo "#################################################"

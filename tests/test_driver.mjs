@@ -18,6 +18,8 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 // had never been ported. A test that can only reach one of two live copies is half a test.
 const DRIVER = process.env.DUAL_AUDIT_DRIVER || resolve(HERE, '../runtime/claude-controller/dual-audit-run.js')
 const RCM = process.env.DUAL_AUDIT_RC_MARKER || '__DUAL_AUDIT_RC'
+// Derived, not hardcoded: the two builds spell their markers differently and share the prefix.
+const LAUNCHM = RCM.replace(/_RC$/, '_LAUNCHED')
 const SRC0 = readFileSync(DRIVER, 'utf8').replace('export const meta', 'const meta')
 const AF = Object.getPrototypeOf(async function () {}).constructor
 
@@ -213,6 +215,28 @@ await t('B6 empty reviewer output -> not forwarded, diagnosed, never a pass',
   (m) => runDriver({ panelReplies: [PENDING, { converged: false, convergence_status: 'codex_unavailable' }], agentReply: '', mutate: m }),
   (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) && r.rc_diagnostics[0].code === 'EMPTY_VERDICT_TEXT' &&
             r.terminal_state === 'INFRASTRUCTURE_BLOCKED')
+
+await t('B7 the wrapper announced a launch and nothing came back -> diagnosed as KILLED, never as "found nothing"',
+  (m) => runDriver({ panelReplies: [PENDING, { converged: false, convergence_status: 'codex_unavailable' }],
+                     agentReply: `${LAUNCHM}=540\n`, mutate: m }),
+  // The whole point of the marker: this text and B8's text both lack a verdict, and before the marker
+  // existed they were the SAME text (empty). They must now land on different codes, and this one must
+  // still be infrastructure — a reviewer that was started and killed has judged nothing.
+  (r, g) => !('codex_exit_code' in g.panelArgsSeen[1]) &&
+            r.rc_diagnostics[0].code === 'LAUNCHED_BUT_NO_VERDICT' &&
+            r.terminal_state === 'INFRASTRUCTURE_BLOCKED',
+  // Teeth: with the launch branch removed it falls back to the old code, which is exactly the
+  // ambiguity this change exists to remove.
+  (src) => src.replace("          : launched ? 'LAUNCHED_BUT_NO_VERDICT'\n", ''))
+
+await t('B8 no launch marker and no block still reads as NO_BLOCK_NO_MARKER (the new branch must not swallow it)',
+  (m) => runDriver({ panelReplies: [PENDING, { converged: false, convergence_status: 'codex_unavailable' }],
+                     agentReply: 'the reviewer said nothing useful\n', mutate: m }),
+  (r, g) => r.rc_diagnostics[0].code === 'NO_BLOCK_NO_MARKER',
+  // Teeth in the other direction: make the launch test always true and this case must go red. A
+  // one-directional check would pass a detector that fires on everything.
+  (src) => src.replace('const launched = LAUNCHED_RE.test(String(verdictText))',
+                       'const launched = true'))
 
 console.log('=== C. Verbatim forwarding and argument threading ===')
 

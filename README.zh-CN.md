@@ -141,6 +141,11 @@ Workflow({
 
 **无法识别的内部状态一律落 `INVALID_AUDIT`**，绝不落到任何读起来像通过的状态。
 
+当某一席的回复读不出来时，结果里还会带 `rc_diagnostics`，每条都有一个机器可读的稳定 `code`
+（`EMPTY_VERDICT_TEXT`、`MARKER_OUTSIDE_ANY_BLOCK` 等）和一句给人看的 `why`。
+**判断请一律基于 `code`，不要基于 `why`**——code 是对外契约，只增不改；那句话则可能被改写或翻译。
+完整清单与每一条对应的处理办法见 [docs/troubleshooting.md](docs/troubleshooting.md)。
+
 ## 隐私、成本，以及什么会离开你的机器
 
 - **你的内容只发给你本来就配置好的模型提供方**——Claude Code 走 Anthropic，Codex CLI 走
@@ -197,6 +202,11 @@ Workflow({
 
 见 [CONTRIBUTING.md](CONTRIBUTING.md)。一句话版本：**改一道门，就要配一个「删掉这道门就会失败」
 的测试。** 一个在有没有被保护代码时都通过的测试，不构成证据。
+
+如果你跑的是这些组件的改造版或另行部署的一份，测试套件可以指向它
+（`DUAL_AUDIT_PANEL`、`DUAL_AUDIT_DRIVER`、`DUAL_AUDIT_WRAPPER` 等），
+`scripts/check-live-parity.sh` 则直接比较两份构建。之所以要有这个：**只能够到自己旁边那一份的
+测试，发现不了真正在用的是另一份**——一道守卫因此只存在于其中一份里，而两边的测试当时都是绿的。
 
 安全问题见 [SECURITY.md](SECURITY.md)。
 

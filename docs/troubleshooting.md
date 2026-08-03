@@ -44,20 +44,29 @@ the problem is on the controller side.
 Same empty output, and the hand check above still succeeds — but the reviewer's transcript ends with
 the tool result *"Command did not complete within its 600s timeout and was moved to the background"*.
 
-The reviewer agent runs the wrapper as a **single** shell command, and Claude Code cuts that command
-off after 600 seconds. Whatever the review then produces is written to a file the agent is no longer
-waiting on, so it returns nothing. This is the one failure that looks the same from the outside as a
-dead reviewer: no verdict, no partial output, nothing to read.
+The reviewer agent runs the wrapper as a **single** shell command, and the caller cuts that command
+off at its own ceiling — in Claude Code, **120 seconds unless the call asks for more**, up to 600.
+Whatever the review then produces is written to a file the agent is no longer waiting on, so it
+returns nothing.
+
+This used to be the one failure that looked identical from the outside to a dead reviewer. It no
+longer is: the wrapper writes a launch marker the instant before it hands control over, so a run that
+started and was killed reports `LAUNCHED_BUT_NO_VERDICT` rather than the same empty output as a run
+that never started. **The marker does not save the review** — it only makes the loss visible, which is
+the difference between losing a seat and not knowing you lost one.
 
 The defaults are set so the wrapper hits its own limit first and says so (`124` timed out, `99` no
-slot). You can still exceed the ceiling by **queueing**: `LOCK_WAIT` and `TIMEOUT` come out of the
-same 600 seconds, so a review that waits four minutes for a slot has under six left. If you see it:
+slot, `97` no budget left to start with). Queueing comes out of the **same** 600 seconds as
+reviewing, which is why `LOCK_WAIT` defaults to 20 rather than to `TIMEOUT`'s 540, and why the
+wrapper re-measures what is left *after* winning a slot or a lock rather than only at entry. If you
+still see it:
 
 - narrow the brief — fewer raw sources, or split one review into two;
-- lower `DUAL_AUDIT_MAX_PAR` so fewer reviews compete for slots, or lower `DUAL_AUDIT_LOCK_WAIT` so a
-  queued one gives up early and loudly instead of being cut off silently;
-- do not raise `DUAL_AUDIT_TIMEOUT` above the ceiling. A budget larger than the ceiling cannot be
-  spent — it only moves the failure from a message you can read to silence.
+- lower `DUAL_AUDIT_MAX_PAR` so fewer reviews compete for slots;
+- do not raise `DUAL_AUDIT_TIMEOUT` on its own. A budget larger than
+  `DUAL_AUDIT_OUTER_BUDGET` cannot be spent — it only moves the failure from a message you can read
+  to silence. If your controller has no 600 s ceiling, raise `DUAL_AUDIT_OUTER_BUDGET` too; see
+  [configuration.md](configuration.md).
 
 ### `INVALID_AUDIT`
 
@@ -125,15 +134,25 @@ for a further round, so the panel escalates rather than converging. That is the 
 ## The exit-code marker
 
 The driver returns `rc_diagnostics` whenever it could not read `__DUAL_AUDIT_RC=` from inside the
-verdict block. The message distinguishes the causes, because they need different fixes:
+verdict block. Each entry carries a `code` and a `why`. The causes are distinguished because they
+need different fixes:
 
-| Message | Fix |
-|---|---|
-| no verdict block and no marker | The reviewer produced no verdict, or the wrapper ran without `--emit-rc`. |
-| a marker exists but is not inside any block | The wrapper did not take the injection path — check that the agent definition passes `--emit-rc`, and that no old command template is in use. |
-| the marker is in an earlier block, not the last | The reviewer printed its verdict more than once with inconsistent injection. |
-| several markers in the last block | Ambiguous; refused fail-closed. |
-| `verdict_text` is empty | The reviewer produced nothing, or the agent call failed. |
+| `code` | `why`, in short | Fix |
+|---|---|---|
+| `EMPTY_VERDICT_TEXT` | nothing came back at all | The reviewer produced nothing, or the agent call failed. Check the wrapper's own exit code below. |
+| `LAUNCHED_BUT_NO_VERDICT` | the wrapper announced the launch, then nothing came back | **The reviewer really did start and was killed part-way.** Almost always a caller wall-clock ceiling shorter than a review needs: set `DUAL_AUDIT_OUTER_BUDGET` to the real ceiling, and give the command itself the longest timeout the caller allows. Infrastructure — never "the review found nothing". |
+| `NO_BLOCK_NO_MARKER` | no verdict block and no marker | The reviewer produced no verdict, or the wrapper ran without `--emit-rc`. |
+| `MARKER_WITHOUT_BLOCK` | a marker, but no `VERDICT..END` block anywhere | The reviewer produced no verdict; the marker you see is the wrapper's fallback append. |
+| `MARKER_OUTSIDE_ANY_BLOCK` | a block exists, the marker is outside every one | The wrapper did not take the injection path — check that the agent definition passes `--emit-rc`, and that no old command template is in use. |
+| `MARKER_IN_EARLIER_BLOCK` | the marker is in an earlier block, not the last | The reviewer printed its verdict more than once with inconsistent injection. |
+| `MARKER_AMBIGUOUS_IN_LAST_BLOCK` | several markers in the last block | Ambiguous; refused fail-closed. |
+| `MARKER_UNREADABLE_INTERNAL_INCONSISTENCY` | exactly one marker in the last block, and it still would not parse | A bug here, not in your setup. Please report it with the reviewer output. |
+
+**`code` is a contract; `why` is not.** Branch on `code` in scripts and assertions — the literals
+never change meaning, and new ones are only ever added. The `why` sentence is for humans and may be
+reworded or translated at any time. They are separate because asserting on prose is a weak-assertion
+trap, and this project hit it: a suite pointed at a build whose diagnostics were written in another
+language went red everywhere while every behaviour was identical.
 
 ## Reviewer wrapper exit codes
 
@@ -141,6 +160,7 @@ verdict block. The message distinguishes the causes, because they need different
 |---|---|
 | 99 | No slot or lock available. (The reviewer can also return 99 itself; the wrapper cannot tell them apart.) |
 | 98 | Token admission failed (`--preflight` or `--batch`). |
+| 97 | The caller's wall-clock ceiling (`DUAL_AUDIT_OUTER_BUDGET`) was already spent before the reviewer could start — usually setup plus queueing. **This is the wrapper refusing on purpose**, so that the failure arrives as a readable message instead of the caller killing the command into an empty stdout. If you see it often, the review is queueing: lower `DUAL_AUDIT_MAX_PAR`, or raise the budget if your caller genuinely has no ceiling. |
 | 124, 137 | Timed out **or** the child was killed. Timeout-*like*, not proof of a timeout: the reviewer can return 124 itself, and 137 also comes from the OOM killer or an external kill. |
 | 9 | stdin was an empty TTY, or the brief was zero bytes. |
 | 8 | A bad argument, a malformed environment value, or a failed path guard. |
