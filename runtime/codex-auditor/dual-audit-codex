@@ -162,6 +162,47 @@ _numenv LOCK_WAIT     DUAL_AUDIT_LOCK_WAIT     540   7200         # also feeds t
 _numenv EXP_MARGIN    DUAL_AUDIT_EXP_MARGIN    900   604800
 _numenv STDIN_TIMEOUT DUAL_AUDIT_STDIN_TIMEOUT 120   3600
 
+# The caller may itself enforce a wall-clock ceiling it cannot raise, and when the two disagree the
+# failure direction is the worst one available: the OUTER limit fires first, this wrapper's own timeout
+# and trap never run, stdout is empty, and an audit that died is indistinguishable from one that found
+# nothing. So model the caller's ceiling explicitly. 600 is the default because that is the ceiling of
+# the tool this wrapper is most often invoked from.
+# ⚠️ WARN AND TIGHTEN, never refuse outright for being "too long": this wrapper is also run from a
+#    terminal and from schedulers that have no such ceiling, and a hard clamp there would silently cut
+#    legitimate long reviews short.
+_numenv OUTER_BUDGET  DUAL_AUDIT_OUTER_BUDGET  600   604800
+_T0=$(date +%s)   # entry time: the remaining budget is MEASURED from here, never summed from constants
+# 🔴 Do NOT compute the remaining budget by adding up the known stages (LOCK_WAIT + TIMEOUT + ...).
+#    That was the first implementation and an independent review demonstrated it wrong: it silently
+#    omitted two real pre-dispatch costs — the stdin snapshot (STDIN_TIMEOUT, 120s by default) and
+#    writing the private credential (30s) — so the true worst case was 740s against a 600s ceiling
+#    while the check stayed quiet. The failure direction of a sum is fixed and invisible: every stage
+#    added later makes it under-count, and nothing announces it. A measurement has no such omission.
+BUDGET_SLACK=10   # room for the seconds after the timeout fires: rounding, the post-SIGKILL return,
+                  # the exit-code injection and cleanup. Not room for the reviewer to run in.
+_budget_left() { echo $(( OUTER_BUDGET - ( $(date +%s) - _T0 ) - KILL_AFTER - BUDGET_SLACK )); }
+# 🔴 The tightening must cover BOTH dispatch paths. Applying it only before the isolated reviewer
+#    starts misses serial entirely — serial forks off earlier — and, worse, the token-shortage branch
+#    DOWNGRADES to serial automatically, which is the path the common caller actually takes. Fixing one
+#    path while leaving the other silent is worse than not fixing it: the version this replaced warned
+#    unconditionally before the mode split, so a partial fix would have turned serial from "warns" into
+#    "says nothing". Hence: a function, called once BEFORE the split, and again after a slot is won so
+#    that queueing time counts too.
+_clamp_timeout() {
+  local left; left=$(_budget_left)
+  if [ "$left" -le 0 ]; then
+    printf 'dual-audit-codex: the outer budget of %ss was already spent before the reviewer could start (%ss of setup). Refusing — starting now would only be killed silently by the caller.\n' \
+           "$OUTER_BUDGET" "$(( $(date +%s) - _T0 ))" >&2
+    exit 97
+  fi
+  if [ "$left" -lt "$TIMEOUT" ]; then
+    printf 'dual-audit-codex: reviewer timeout tightened from %ss to %ss (%s path) — %ss of the %ss outer budget has already been spent.\n' \
+           "$TIMEOUT" "$left" "${1:-?}" "$(( $(date +%s) - _T0 ))" "$OUTER_BUDGET" >&2
+    printf 'dual-audit-codex:    this keeps the wrapper timing out FIRST and leaving __DUAL_AUDIT_RC=124 behind, instead of being killed into an empty stdout.\n' >&2
+    TIMEOUT="$left"
+  fi
+}
+
 # Argument guard: consume --serial; refuse -C/--cd in every form (it would let the reviewer chdir back into a directory whose configuration we deliberately escaped), without touching the lowercase -c/--config
 ARGS=()
 SANDBOX_OK=0        # a `--sandbox read-only` was seen, in either spelling
@@ -537,6 +578,7 @@ if [ ! -s "$STDIN_SNAP" ]; then
   exit 9
 fi
 
+_clamp_timeout pre-dispatch   # once BEFORE the mode split, so BOTH paths are covered
 [ "$MODE" = serial ] && { run_serial "$@"; exit $?; }
 
 # ==================== isolated: the default path ====================
@@ -582,6 +624,7 @@ if [ "$REM" -lt 0 ] || [ "$REM" -lt $((TIMEOUT + EXP_MARGIN)) ]; then
     exit 98
   fi
   echo "dual-audit-codex: access_token token has only ${REM}s left (< timeout+margin=$((TIMEOUT+EXP_MARGIN))s) or could not be parsed -> releasing the slot and downgrading to serial" >&2
+  _clamp_timeout serial-degraded   # this is the path the common caller actually takes
   run_serial "$@"; exit $?
 fi
 
@@ -655,6 +698,7 @@ if [ "$EMIT_RC" = 1 ]; then
   # because the caller waits for completion anyway.
   # Defaulting this OFF is load-bearing: this wrapper is shared infrastructure used by other
   # callers, and defaulting it on would rewrite every caller's stdout.
+  _clamp_timeout isolated   # again after the slot was won, so time spent QUEUEING counts against the budget too
   _EMIT_OUT=$(timeout -k "$KILL_AFTER" "$TIMEOUT" \
     env HOME="$EHOME" CODEX_HOME="$RUN_ROOT" "$REAL_CODEX" ${NEWARGS+"${NEWARGS[@]}"} < "$RUN_ROOT/brief.md" 9>&-)
   RC=$?                  # MUST be captured before the pipe: once `| _emit_rc_inject` is added, $? is awk exit code

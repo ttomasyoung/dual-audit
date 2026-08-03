@@ -11,7 +11,9 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 const HERE = dirname(fileURLToPath(import.meta.url))
-const PANEL = resolve(HERE, '../runtime/core/dual-audit-panel.js')
+// Overridable so this ONE suite can also be pointed at a separately deployed copy of the same panel.
+// A suite that can only reach the file next to it cannot notice the other copy drifting.
+const PANEL = process.env.DUAL_AUDIT_PANEL || resolve(HERE, '../runtime/core/dual-audit-panel.js')
 const SRC0 = readFileSync(PANEL, 'utf8').replace('export const meta', 'const meta')
 const AF = Object.getPrototypeOf(async function () {}).constructor
 
@@ -52,6 +54,9 @@ const cxMarker = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: static/import ok, 
 const CLAUDE_WIDE_COLON = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: read 3 files\uFF1C br\uFF1EP0\uFF1A the delete path removes user data\nVERIFIED: pass\nEND'
 // A value naming VERIFIED, with a real P0 recorded: prose about the fields, which must NOT be refused.
 const CLAUDE_TALKS_ABOUT = 'VERDICT: REJECT\nP0: the delete path removes user data at line 44\nEVIDENCE: read 3 files line 12\nVERIFIED: fail\nRECOMMEND: an honest VERIFIED: fail beats a guess\nEND'
+// The shape a hard gate would refuse and must not: a cross-examination DELTA saying WHICH of the other
+// side's P0s this reviewer overturned. Naming P0 there is what DELTA is FOR. 8 of the 13 refusals.
+const CLAUDE_DELTA_NAMES_P0 = 'VERDICT: APPROVE\nP0: none\nDELTA: I overturned the other side P0: (1) instrumented the call, the guard uses the same path at line 378\nEVIDENCE: read 3 files line 12\nVERIFIED: pass\nEND'
 const CLAUDE_CLEAN_R = 'VERDICT: REJECT\nP0: none\nEVIDENCE: reviewed line 5 structure ok\nVERIFIED: pass\nEND'  // clean fixture: only the consensus gate can block it
 const cxApprove      = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: static/import ok, 3 modules\nVERIFIED: pass\nAUDIT-ID: ${id}\nEND`
 const cxApproveDelta = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: re-ran, fix line 90\nVERIFIED: pass\nDELTA: re-verified line 90 now passes\nAUDIT-ID: ${id}\nEND`
@@ -138,7 +143,14 @@ const CASES_B = [
   { n: 'B1b the same verdict twice, the exit marker surviving in only one copy, still folds',
     args: { ...R2ok, codex_prev_verdict_raw: cxApprove(A1) + '\n\n' + cxApprove(A1).replace('\nEND', '\n__DUAL_AUDIT_RC=0\nEND') },
     fn: () => CLAUDE_APPROVE, ok: conv,
-    g: '!/^[ \\t]*__[A-Z][A-Z0-9_]*=/.test(L)', gf: '!/^ZZZ_MATCHES_NOTHING$/.test(L)' },
+    // 🔴 NOT COUNTED AS A KILLABLE MUTANT, and the reason is recorded honestly (neither an oversight
+    // nor "it would not die so we let it pass"). After the merge this case is covered by TWO
+    // INDEPENDENT MECHANISMS, so no single-point mutation changes the outcome: (1) one block marked
+    // and one not -> anyMarker=true -> candidates=marked -> one block -> converge; (2) even with (1)
+    // disabled, both enter dedup and the dedup key strips the marker, so they are identical -> still
+    // one block -> converge. Probed one mutation at a time: mutants on either mechanism survive. That
+    // is redundant coverage, not a dead gate. If either mechanism is removed, this note is void.
+  },
   // ...and nothing wider than that is ignored: two blocks that differ in a field a reader cares about
   // are still two verdicts, and still refused.
   { n: 'B1c two blocks differing in a real field are still ambiguous',
@@ -149,7 +161,7 @@ const CASES_B = [
   { n: 'B4 reviewer produced empty output',          args: { ...R2ok, codex_prev_verdict_raw: '' },                     fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r1_codex_unavailable_retry' },
   // B6 uses a CLEAN Claude REJECT, so the consensus gate is the only thing that can block it.
   // Removing that gate produces a false convergence, which is what isolates it.
-  { n: 'B6 claude clean-REJECT',    args: { ...BSRC, prior_state: R1cr.prior_state, codex_prev_verdict_raw: cxApprove(A1cr), codex_exit_code: 0 }, fn: () => CLAUDE_CLEAN_R, ok: r => r.converged === false && r.convergence_status === 'r2_pending_codex',
+  { n: 'B6 claude clean-REJECT',    args: { ...BSRC, prior_state: R1cr.prior_state, codex_prev_verdict_raw: cxApprove(A1cr), codex_exit_code: 0 }, fn: () => CLAUDE_CLEAN_R, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex',
     g: "if (valid.length && !valid.every(a => a.parsed.approves)) blockers.push('not all valid auditors APPROVE')", gf: "if (false) blockers.push('not all valid auditors APPROVE')" },
   { n: 'B7 circular reference in the arguments',           args: circ,                                                        fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && /AUDIT IDENTITY UNAVAILABLE/.test(r.error || ''), g: 'if (CTX_SIG == null || CTX_SIG_ERROR) {', gf: 'if (false && (CTX_SIG == null || CTX_SIG_ERROR)) {' },
   { n: 'B8 high risk with no independent source',           args: noSrc,                                                       fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && (r.blockers || []).some(b => /no independent R1 source/.test(b)), g: 'if (n === 1 && !hasIndependentR1Source) {', gf: 'if (false) {' },
@@ -158,27 +170,27 @@ const CASES_B = [
   { n: 'B9 frozen round 1 missing',          args: { ...BSRC, prior_state: psNoFrozen, codex_prev_verdict_raw: cxApprove(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'prior_state_frozen_r1_missing', g: 'if (prior && priorRoundValid && priorRound >= 2 && !frozenOk) {', gf: 'if (false) {' },
   // B10: the reviewer rejects in round 1 and approves in round 2 with a DELTA (so the delta gate is not
   // what blocks). The flip-stability gate must block; removing it converges falsely.
-  { n: 'B10 anti-flip: reviewer flipped',   args: { ...BSRC, prior_state: ps2, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_pending_codex', g: 'if (codexFreshFlipHard) {', gf: 'if (false) {' },
+  { n: 'B10 anti-flip: reviewer flipped',   args: { ...BSRC, prior_state: ps2, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (codexFreshFlipHard) {', gf: 'if (false) {' },
   // B11: a cumulative budget already at the ceiling means this round would exceed it, so it is refused
   // before convergence rather than after.
   { n: 'B11 budget over the hard ceiling',          args: { ...BSRC, prior_state: { ...ps2, cumulative_used: 18 }, codex_prev_verdict_raw: cxApprove(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && (r.blockers || []).some(b => /HARD_TOTAL_CEILING.*exceeded/.test(b)), g: 'if (ledger.totalUsed > HARD_TOTAL_CEILING) {', gf: 'if (false) {' },
   // B12: an approving verdict whose EVIDENCE contains no digit must not converge. Removing the digit
   // gate converges falsely.
-  { n: 'B12 EVIDENCE without a digit does not converge',   args: { ...BSRC, prior_state: R1nd.prior_state, codex_prev_verdict_raw: cxApprove(A1nd), codex_exit_code: 0 }, fn: () => CA_NODIGIT, ok: r => r.converged === false && r.convergence_status === 'r2_pending_codex', g: 'if (unanchoredEvidence.length) blockers.push', gf: 'if (false) blockers.push' },
+  { n: 'B12 EVIDENCE without a digit does not converge',   args: { ...BSRC, prior_state: R1nd.prior_state, codex_prev_verdict_raw: cxApprove(A1nd), codex_exit_code: 0 }, fn: () => CA_NODIGIT, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex', g: 'if (unanchoredEvidence.length) blockers.push', gf: 'if (false) blockers.push' },
   // ==== Validity gate and the parser's negative paths. This is where a decisive hole once lived:
   //      forcing the validity flag to true made the ENTIRE suite pass. ====
   // B13: a missing P0 is caught by the validity gate alone (no downstream gate overlaps it), which makes
   // it a clean isolation: removing that sub-gate converges falsely.
-  { n: 'B13 reviewer verdict missing P0 is invalid', args: { ...R2ok, codex_prev_verdict_raw: cxNoP0(A1) },       fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_pending_codex', g: 'p0Raw !== null &&', gf: 'true &&' },
+  { n: 'B13 reviewer verdict missing P0 is invalid', args: { ...R2ok, codex_prev_verdict_raw: cxNoP0(A1) },       fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex', g: 'p0Raw !== null &&', gf: 'true &&' },
   // B15-B18 cover the parser's negative paths positively: a malformed verdict must not be treated as a
   // valid approval. Their mutants are covered by the downstream defence-in-depth gates instead.
-  { n: 'B15 reviewer verdict missing VERIFIED does not converge', args: { ...R2ok, codex_prev_verdict_raw: cxNoVerified(A1) }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_pending_codex' },
-  { n: 'B16 reviewer EVIDENCE without a digit does not converge',   args: { ...R2ok, codex_prev_verdict_raw: cxEvNoDigit(A1) },  fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_pending_codex' },
-  { n: 'B17 placeholder inside the reviewer block does not converge',   args: { ...R2ok, codex_prev_verdict_raw: cxPlaceholder(A1) },fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_pending_codex' },
+  { n: 'B15 reviewer verdict missing VERIFIED does not converge', args: { ...R2ok, codex_prev_verdict_raw: cxNoVerified(A1) }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex' },
+  { n: 'B16 reviewer EVIDENCE without a digit does not converge',   args: { ...R2ok, codex_prev_verdict_raw: cxEvNoDigit(A1) },  fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex' },
+  { n: 'B17 placeholder inside the reviewer block does not converge',   args: { ...R2ok, codex_prev_verdict_raw: cxPlaceholder(A1) },fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex' },
   { n: 'B18 reviewer verdict with no VERDICT fails identity',        args: { ...R2ok, codex_prev_verdict_raw: cxNoVerdict(A1) },  fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'codex_verdict_identity_mismatch' },
   // B19 is the Claude-side anti-flip: round 1 rejects, round 2 approves with a DELTA (a genuine flip)
   // while the reviewer approves throughout, so the Claude flip gate must block. Removing it converges falsely.
-  { n: 'B19 anti-flip: Claude side flipped',   args: { ...BSRC, prior_state: R2cr.prior_state, codex_prev_verdict_raw: cxApprove(R1cr.task_fingerprint + '_r2'), codex_exit_code: 0 }, fn: () => CA_DELTA, ok: r => r.converged === false && r.convergence_status === 'r3_pending_codex', g: 'if (claudeFreshFlipHard) {', gf: 'if (false) {' },
+  { n: 'B19 anti-flip: Claude side flipped',   args: { ...BSRC, prior_state: R2cr.prior_state, codex_prev_verdict_raw: cxApprove(R1cr.task_fingerprint + '_r2'), codex_exit_code: 0 }, fn: () => CA_DELTA, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (claudeFreshFlipHard) {', gf: 'if (false) {' },
   // ==== The remaining live exits ====
   // B20: consecutive unavailable reviewer attempts reach the cap and escalate, which is different from
   // the single-attempt retry cases above.
@@ -189,14 +201,23 @@ const CASES_B = [
   // DELTA (so the delta gate is not what blocks) and keeps the Claude side stably approving (so the flip
   // gate is not what blocks), which leaves the missing-state guard as the ONLY thing that can block —
   // otherwise another gate would mask it and the mutant would look killed when it was not.
-  { n: 'B22 missing prev_round_stance is refused', args: { ...BSRC, prior_state: psNoStance, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_pending_codex', g: 'if (priorRound >= 2 && !prevStanceUsable) {', gf: 'if (false) {' },
+  { n: 'B22 missing prev_round_stance is refused', args: { ...BSRC, prior_state: psNoStance, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (priorRound >= 2 && !prevStanceUsable) {', gf: 'if (false) {' },
   // B25: a blocker reachable only by reading a value the gates never consult must not converge. The
   // reviewer is told verbatim that anything outside the field shapes is refused rather than
   // reinterpreted; until this gate existed the parser only warned and the round approved.
   { n: 'B25 a blocker hidden inside another field value cannot converge',
     args: { ...BSRC, prior_state: R1hid.prior_state, codex_prev_verdict_raw: cxApprove(R1hid.task_fingerprint + '_r1'), codex_exit_code: 0 },
-    fn: () => CLAUDE_HIDDEN_P0, ok: r => r.converged === false,
-    g: ' && !hidesGatingField', gf: '' },
+    // 🔴 Changed to ADVISORY rather than invalidating, on the strength of a larger measured corpus.
+    // The original design was calibrated on 76 verdicts and chose a hard gate. Re-calibrated on 470
+    // real verdicts, a hard gate would add 13 rejections with ZERO true positives - 8 are
+    // cross-examination DELTAs explaining which of the other side's P0s were rejected (exactly what a
+    // DELTA is for) and 5 are reviews OF THIS PANEL quoting its own field names as data.
+    // Worse: a rejection DISCARDS THE WHOLE VERDICT, including any real P0s it was carrying.
+    fn: () => CLAUDE_HIDDEN_P0, ok: r => (r.advisories || []).some(a => /contains "P0:"/.test(a)),
+    g: 'const hidesGatingWarn = hidesGatingField', gf: 'const hidesGatingWarn = false && hidesGatingField' },
+  { n: 'B25c a cross-examination DELTA naming the other side P0 still converges',
+    args: { ...BSRC, prior_state: R1hid.prior_state, codex_prev_verdict_raw: cxApprove(R1hid.task_fingerprint + '_r1'), codex_exit_code: 0 },
+    fn: () => CLAUDE_DELTA_NAMES_P0, ok: r => r.converged === true },
   // B26: the good case for B25. A value mentioning a NON-gating field name is prose, and rejecting it
   // would cost a round for nothing — a gate that fires on everything is not a gate.
   { n: 'B26 a value naming a non-gating field still converges',
@@ -216,7 +237,8 @@ const CASES_B = [
   // B29: a colon variant is still a colon to whoever wrote it.
   { n: 'B29 a blocker hidden behind a full-width colon cannot converge',
     args: { ...BSRC, prior_state: R1wid.prior_state, codex_prev_verdict_raw: cxApprove(R1wid.task_fingerprint + '_r1'), codex_exit_code: 0 },
-    fn: () => CLAUDE_WIDE_COLON, ok: r => r.converged === false },
+    // As in B25: advise, do not reject. But a fullwidth colon must still be SEEN.
+    fn: () => CLAUDE_WIDE_COLON, ok: r => (r.advisories || []).some(a => /contains "P0:"/.test(a)) },
   // B30: the good case for B25/B29. Reviewers discuss these fields in prose constantly; an earlier
   // version of the rule refused 15 of 76 real verdicts for exactly this.
   { n: 'B30 prose naming a field, with a real blocker recorded, is not refused',
@@ -225,7 +247,7 @@ const CASES_B = [
   // ==== ⑤ claim fixtures + ⑥ claim gate ====
   { n: 'B23 claim mode converges on a clean anchored round', args: { ...B_BIO, prior_state: R1bio.prior_state, codex_prev_verdict_raw: cxClaimA(R1bio.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAIM_A, ok: r => r.converged === true && r.convergence_status === 'converged' && (r.blockers || []).length === 0 && r.needs_expert_signoff === false },
   // B24: a Claude verdict whose ANCHOR is not "anchored" must be blocked by the claim gate.
-  { n: 'B24 an unanchored claim is blocked by the claim gate', args: { ...B_BIO, prior_state: R1bioUn.prior_state, codex_prev_verdict_raw: cxClaimA(R1bioUn.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAIM_UN, ok: r => r.converged === false && r.convergence_status === 'r2_pending_codex', g: "if (claimGap) blockers.push('claims not fully anchored", gf: "if (false) blockers.push('claims not fully anchored" },
+  { n: 'B24 an unanchored claim is blocked by the claim gate', args: { ...B_BIO, prior_state: R1bioUn.prior_state, codex_prev_verdict_raw: cxClaimA(R1bioUn.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAIM_UN, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex', g: "if (claimGap) blockers.push('substantive claims not fully anchored", gf: "if (false) blockers.push('substantive claims not fully anchored" },
 ]
 
 // ============ Runner: the original source, then mutants (distinguishing a crash from an assertion failure) ============
@@ -319,6 +341,61 @@ console.log('=== Group C: the reviewer brief the panel returns to the driver mus
   rec(b3m.length > 0 && !RE_A.test(b3m), 'C3[mut] breaking the claim-mode contract call drops ANCHOR from the brief', 'the brief still carries ANCHOR')
 }
 
+console.log('=== Group F: the bounded-scope and time-box paragraph in the reviewer brief ===')
+// Why this group exists: the paragraph is prose, so nothing mechanical was watching it, and it had
+// already been wrong TWICE in ways that flipped the panel from fail-closed to fail-open. Version one
+// said only "a partial verdict beats no verdict", which made FINISHING cheaper than being HONEST: an
+// APPROVE whose own text admitted it had read 2 of 7 targets converged with no blockers. Version two
+// offered APPROVE_WITH_CHANGES as the polite way out — and approvesFinal treats that identically to
+// APPROVE, so the panel was pointing the reviewer back into the same hole. Both were caught by people
+// reading it. Prose that gates convergence needs a test like any other gate.
+//
+// ⚠️ The observable is `r.codex_brief`, NOT the Claude-side prompt: this paragraph only ever goes to
+// the reviewer. Asserting against the wrong observable is how the first attempt at this group produced
+// six failures and, worse, two negative assertions that passed for free because the string they were
+// searching was empty. Hence the non-empty precondition on every case below.
+{
+  const bCode  = (await runPanel(BSRC,  async () => CLAUDE_APPROVE)).r.codex_brief || ''
+  const bClaim = (await runPanel(B_BIO, async () => CLAIM_A)).r.codex_brief || ''
+  rec(bCode.length > 0 && bClaim.length > 0, 'F0 precondition: both briefs are non-empty (else every assertion below passes for free)', 'a brief came back empty, so this group proves nothing')
+
+  const ECASES = [
+    { n: 'F1 the brief forbids reading outside the listed paths',
+      ok: b => /BOUNDED SCOPE \(mandatory\)/.test(b) && /Do NOT grep\/rg\/find/.test(b),
+      g: "'BOUNDED SCOPE (mandatory): read ONLY", gf: "'XX (mandatory): read ONLY" },
+    { n: 'F2 the brief states the ceiling is hard and that overrunning returns NOTHING',
+      ok: b => /TIME BOX \(hard, \d+ minutes\)/.test(b) && /returns NOTHING/.test(b),
+      g: 'TIME BOX (hard, ${TIME_BOX_MIN} minutes)', gf: 'TIME BOX (soft, ${TIME_BOX_MIN} minutes)' },
+    // 🔴 The single most important assertion here: an incomplete review must be told to REJECT, and
+    //    must be told that BOTH approving shapes converge. Naming only APPROVE is the exact bug that
+    //    shipped once already.
+    { n: 'F3 an incomplete review is forbidden from carrying EITHER approving verdict',
+      ok: b => /MUST NOT carry VERDICT: APPROVE or APPROVE_WITH_CHANGES/.test(b) && /Use VERDICT: REJECT\./.test(b),
+      g: 'MUST NOT carry VERDICT: APPROVE or APPROVE_WITH_CHANGES', gf: 'MUST NOT carry VERDICT: APPROVE' },
+  ]
+  for (const c of ECASES) {
+    rec(bCode.length > 0 && c.ok(bCode), c.n, 'the code-mode brief does not carry it')
+    if (SRC0.split(c.g).length - 1 !== 1) { rec(false, c.n + '[mut]', `mutation anchor is not unique: ${c.g}`); continue }
+    const bm = (await runPanel(BSRC, async () => CLAUDE_APPROVE, s => s.replace(c.g, c.gf))).r.codex_brief || ''
+    rec(bm.length > 0 && !c.ok(bm), c.n + '[mut]', 'the mutant brief still satisfies the assertion — the check has no teeth')
+  }
+
+  // The honest valve must name the field that ACTUALLY gates the mode. Pointing a claim-mode review at
+  // VERIFIED: fail is not a smaller mistake than saying nothing: codeFieldsOk = !codeRelevant || ...,
+  // so VERIFIED is inert there, and the incident that produced this whole paragraph WAS claim mode.
+  rec(bClaim.length > 0 && /set ANCHOR: partial \(or none\)/.test(bClaim) && /UNANCHORED_CLAIMS/.test(bClaim),
+      'F4 claim mode points the honest valve at ANCHOR/UNANCHORED_CLAIMS', 'claim mode does not name the field that gates it')
+  rec(bClaim.length > 0 && !/set VERIFIED: fail and name every target/.test(bClaim),
+      'F5 claim mode does NOT point at VERIFIED, which is inert there', 'claim mode points at an inert field')
+  rec(bCode.length > 0 && /set VERIFIED: fail and name every target/.test(bCode),
+      'F6 code mode points the honest valve at VERIFIED', 'code mode does not name the field that gates it')
+  // F5 is a NEGATIVE assertion, so it needs its own teeth check: swap the two arms and it must fail.
+  const bClaimSwap = (await runPanel(B_BIO, async () => CLAIM_A, s => s.replace(
+    "claimMode\n    ? 'If you could not cover everything: set ANCHOR: partial", "!claimMode\n    ? 'If you could not cover everything: set ANCHOR: partial"))).r.codex_brief || ''
+  rec(bClaimSwap.length > 0 && /set VERIFIED: fail and name every target/.test(bClaimSwap),
+      'F5[mut] inverting the mode test makes claim mode point at the inert field', 'inverting the mode test changed nothing — F5/F6 have no teeth')
+}
+
 // ============ Group D: single load-bearing convergence and parsing gates ============
 // Each was isolated by probe: the original source does NOT converge, and removing that ONE gate makes it
 // converge — which is what proves the gate is the sole blocker rather than one of several.
@@ -336,7 +413,7 @@ console.log('=== Group D: single load-bearing convergence and parsing gates ==='
   // which is a different failure from the flip gate. The reviewer chain and the Claude chain are symmetric.
   const ps3c  = (await runPanel({ ...BSRC, prior_state: ps2, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, () => CLAUDE_APPROVE)).r
   const ps3cl = (await runPanel({ ...BSRC, prior_state: R2cr.prior_state, codex_prev_verdict_raw: cxApprove(R1cr.task_fingerprint + '_r2'), codex_exit_code: 0 }, () => CA_NODELTA)).r
-  const okPend = r => r.converged === false && r.convergence_status === 'r2_pending_codex'
+  const okPend = r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex'
   const DCASES = [
     { n: 'D1 approving while VERIFIED says fail is blocked', args: { ...BSRC, prior_state: R1vf.prior_state, codex_prev_verdict_raw: cxApprove(R1vf.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: okPend, g: 'if (codeGap) blockers.push(codeGap)', gf: 'if (false) blockers.push(codeGap)' },
   // Two gates deliberately NOT tested here, with the reasoning recorded so nobody adds them back as

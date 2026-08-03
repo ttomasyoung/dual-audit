@@ -278,7 +278,10 @@ while (calls < MAX_PANEL_CALLS) {
   // is terminal (converged, escalated, arguments refused, or budget exhausted).
   const stage = String(res.audit_stage || '')
   const status = String(res.convergence_status || '')
-  const waitingForCodex = /_pending_codex$/.test(stage) || /_pending_codex$/.test(status) ||
+  // Compatible read: both the new _handoff_to_codex and the old _pending_codex are accepted,
+  // otherwise an unsynced panel copy or a replayed old record is misread as "the panel is finished".
+  const HANDOFF_RE = /_(handoff_to|pending)_codex$/
+  const waitingForCodex = HANDOFF_RE.test(stage) || HANDOFF_RE.test(status) ||
                           stage === 'codex_retry_pending' || status === 'codex_retry_pending'
   if (!waitingForCodex) {
     return finish(res, { panel_calls: calls, driver_trace: trace, rc_diagnostics: rcDiagnostics })
@@ -337,6 +340,26 @@ while (calls < MAX_PANEL_CALLS) {
   // The marker line is NOT stripped: the driver forwards verdict text verbatim. The
   // panel treats it as one unparsed note plus a warning; the block stays valid.
   codexExitCode = rcInsideVerdictBlock(verdictText)
+  // 🔴 When one reviewer attempt fails and a later one succeeds, the earlier diagnostic must be
+  //    marked SUPERSEDED. Measured incident: a round ran the reviewer twice - the first attempt was
+  //    killed by a caller-imposed wall-clock ceiling and emitted only a forwarder status report (no
+  //    END, no marker), the second returned a complete verdict with both. The final result therefore
+  //    carried "no VERDICT..END block and no marker" alongside a panel advisory reporting the marker
+  //    it had just read. Both statements were true and about DIFFERENT attempts, but side by side
+  //    they read as a contradiction: the caller concluded the reviewer had never run and reported the
+  //    round as a one-sided self-audit, then had to correct that.
+  //    ⚠️ The parser was never wrong. The good verdict had its END and its marker, and BLOCK_RE
+  //    matched it. What was wrong is that a record describing ONE ATTEMPT was phrased as if it
+  //    described the round. A diagnostic that cannot say which attempt it is about will be read as a
+  //    conclusion about all of them.
+  if (codexExitCode !== null) {
+    for (const d of rcDiagnostics) {
+      if (d.superseded_by_call == null) {
+        d.superseded_by_call = calls
+        d.why = `[superseded by call${calls}; NOT this round's outcome] ${d.why}`
+      }
+    }
+  }
   codexPrevRaw = verdictText
 
   if (codexExitCode === null) {
@@ -354,6 +377,21 @@ while (calls < MAX_PANEL_CALLS) {
     const inLast = nBlocks ? countMarkers(blocks[nBlocks - 1]) : 0
     const inAnyBlock = blocks.reduce((n, b) => n + countMarkers(b), 0)
     const anywhere = /__DUAL_AUDIT_RC=/.test(String(verdictText))
+    // 🔴 `code` is the STABLE machine-readable identifier; `why` is the human sentence.
+    //    They are separate because asserting on prose is a known weak-assertion trap: reword the
+    //    sentence and the test fails while the behaviour is unchanged, and translate it and every
+    //    such test goes red at once. That is not hypothetical — it is exactly what happened when
+    //    this suite was first pointed at a copy whose diagnostics were written in another language.
+    //    Once a code is published it is a contract: never change a literal, only add new ones.
+    const code = !verdictText
+      ? 'EMPTY_VERDICT_TEXT'
+      : nBlocks === 0
+        ? (anywhere ? 'MARKER_WITHOUT_BLOCK' : 'NO_BLOCK_NO_MARKER')
+      : inLast > 1 ? 'MARKER_AMBIGUOUS_IN_LAST_BLOCK'
+      : inLast === 1 ? 'MARKER_UNREADABLE_INTERNAL_INCONSISTENCY'
+      : inAnyBlock > 0 ? 'MARKER_IN_EARLIER_BLOCK'
+      : anywhere ? 'MARKER_OUTSIDE_ANY_BLOCK'
+      : 'NO_MARKER_ANYWHERE'
     const why = !verdictText
       ? 'verdict_text is empty — the reviewer produced no output, or the agent call failed'
       : nBlocks === 0
@@ -371,9 +409,16 @@ while (calls < MAX_PANEL_CALLS) {
           + '(check: does the agent definition pass --emit-rc; did it fall back to serial mode; is the forwarder using an old command template)'
       : 'no marker inside or outside any block — the wrapper ran without --emit-rc, or the output was truncated by the forwarder'
     rcDiagnostics.push({
-      call: calls, blocks: nBlocks,
+      call: calls, code, blocks: nBlocks,
       markers_in_last_block: inLast, markers_in_any_block: inAnyBlock,
-      marker_present_anywhere: anywhere, why,
+      marker_present_anywhere: anywhere,
+      // One record describes ONE attempt. null = nothing has superseded it yet; the loop above fills
+      // this in with the call number as soon as some later attempt does return a usable exit code.
+      superseded_by_call: null,
+      // The evidence the classification rests on, so a reader can check it without opening journals.
+      verdict_text_len: String(verdictText).length,
+      verdict_text_tail: String(verdictText).slice(-160),
+      why: `call${calls}: ${why}`,
     })
     log(`call${calls}: no __DUAL_AUDIT_RC inside the verdict block — not forwarded, so the panel will treat the reviewer as unavailable. Reason: ${why}`)
   }
