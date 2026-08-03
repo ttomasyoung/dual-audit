@@ -34,6 +34,11 @@ quietly reads as approval.
   verdicts and must address the disagreement. Round 1 is immutable. Changing position **only**
   because the other side sounded more confident does not count as convergence, and the protocol
   asks for the evidence that changed your mind.
+- **You get separate answers to two different questions.** For code-related work a **run seat**
+  executes the thing on a fixture and reports what actually happened, while a **logic seat** never
+  runs it and asks whether the method answers the right question at all. Ask one reviewer both and
+  it answers the easy one: it reports that the script executed cleanly, which is true, and says
+  nothing about it being the wrong script.
 - **Agreement is not proof.** A claim that cannot be anchored to something outside the two
   reviewers is escalated for human sign-off rather than converged on.
 - **It is bounded.** At most three rounds, with a hard ceiling on reviewer calls. It converges,
@@ -44,17 +49,30 @@ quietly reads as approval.
   handing over, so a review that started and died reports `LAUNCHED_BUT_NO_VERDICT` instead of the
   empty output a review that never started would produce.
 
+**The panel reviews. It does not produce.** Production happens outside it; the panel only examines
+what you submit. The author and the verifier cannot quietly become the same process.
+
 The protocol is controller-neutral by design. This release uses Claude Code as the controller and
 Codex as the independent reviewer; the review state and verdict contract do not assume that.
 
-## Two lanes
+## One panel, two depths
+
+`light-audit` is `mode: 'quick'` on the same panel: same seats, same gates, same terminal states, one
+round instead of three. **The gates are identical at either depth — a finding that blocks at three
+rounds blocks at one.**
 
 | | `dual-audit` | `light-audit` |
 |---|---|---|
-| What | Full bounded panel | One independent second opinion |
-| Rounds | Up to 3, with cross-examination | At most 2 attempts, then escalate |
-| Use for | Definitions, thresholds, rules, load-bearing output, irreversible actions | A small disagreement, or a run that did not settle the question |
-| Cost | Minutes and tens of thousands of tokens per reviewer pass | One reviewer pass |
+| Depth | Up to 3 rounds, with cross-examination | 1 round |
+| Cost | Roughly 9 reviewer passes | Roughly 3 |
+| Choose it for | Definitions, thresholds, rules, load-bearing output, irreversible actions | A small disagreement, or a run that did not settle the question |
+
+One panel with a depth setting is simpler and stricter than the two mechanisms it replaces. The old
+cheap lane was a different thing: a single reviewer briefed by *you*, reading your framing of the
+problem instead of the problem — the precise failure the expensive lane existed to prevent — and
+with no Claude-side seat, so a question about whether code *works* was answered by reading it. Quick
+depth inherits the independent first-round reading and the run seat, and gives up only
+cross-examination.
 
 And a third lane that costs nothing: **just run the check.** When a deterministic test, a smoke
 test or a dry run can settle the question, use facts instead of opinions. The skills say so
@@ -147,6 +165,39 @@ Workflow({
 `task` and `context` must be self-contained — the reviewers do not share the controller's context.
 For anything involving code, `contextPack` is required (targets, expected outputs, canonical
 docs), and every path in it must be absolute. See [docs/configuration.md](docs/configuration.md).
+
+## What comes back
+
+You hand in finished work and its raw sources. You get back a terminal state, the evidence each
+reviewer actually read, anything blocking, and whatever needs a human. A real result, lightly
+trimmed:
+
+```
+terminal_state:  NOT_CONVERGED
+convergence_status: not_converged        rounds_run: 1        panel_calls: 2
+blockers:
+  - not all valid auditors APPROVE
+  - 1 open P0
+  - code dry-run/smoke-test FAILED (VERIFIED:fail)
+unresolved_p0:
+  - "the gate reports green after the requirement is removed, because it only greps for the
+     presence of two numbers; a rewrite that withdraws the requirement while keeping both
+     figures still passes, so CI can approve a definition that leaves seats at the short default"
+agent_budget:    { total_used: 3, hard_ceiling: 18 }
+recommended_next_action:
+  NOT converged within cap. Surface to the user; do NOT pass unverified output down the chain.
+```
+
+Three things to notice, because they are the whole design.
+
+**It did not converge, and it says so first.** No score, no percentage, no "mostly fine". Either the
+gates passed or they did not.
+
+**The blocking finding carries a damage chain** — condition, error, consequence — not an opinion
+about style. A finding without one is not a finding, and the protocol says so to both reviewers.
+
+**The budget is in the result.** You can see it stopped at 3 reviewer calls out of a hard ceiling of
+18, so "it kept going until it agreed" is not a thing that can have happened.
 
 ## Reading the result
 

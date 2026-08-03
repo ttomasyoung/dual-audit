@@ -34,6 +34,29 @@ reviewer whose output arrived without its exit code, a brief whose hash matched 
 did not. Every one of those used to be a pass. A refusal where there used to be a pass is a
 breaking change for anyone who built on the old behaviour, and it should cost a major version.
 
+### Changed — the shape of the thing
+
+- **Two mechanisms became one panel with a depth setting.** `light-audit` is now `mode: 'quick'` on
+  the same panel: same seats, same independent first-round reading, same gates, same terminal
+  states, one round instead of three. It used to be a different mechanism — a single read-only
+  reviewer dispatched with a brief the *caller* wrote — which meant the cheap lane read your framing
+  of the problem instead of the problem, opting out of the one guarantee that made the expensive
+  lane worth paying for, and had no Claude-side seat, so a question about whether code *works* was
+  answered by reading it. The gates are identical at either depth: a finding that blocks at three
+  rounds blocks at one.
+- **The logic seat is separate from the run seat.** For code-relevant work the Claude side now
+  dispatches two reviewers: one that executes the work on a fixture and reports what happened, and
+  one that never runs it and asks whether the method answers the right question. Asked both
+  questions, a single reviewer answers the easy one — it reports that the script executed cleanly,
+  which is true, and says nothing about it being the wrong script. Both seats derive from a single
+  definition (`SEAT_SPECS`), which the run-seat classifier and the `prior_state` shape check had
+  previously duplicated by convention.
+- **The panel no longer dispatches workers.** Production happens outside it; the panel only examines
+  what is submitted. Fewer moving parts, and the author and the verifier cannot collapse into one
+  process.
+- **It costs less.** Quick depth is roughly three reviewer passes against roughly nine at full
+  depth, and the Claude side sends at most two seats per round rather than three.
+
 ### Added
 
 - `WHY.md` and `WHY.zh-CN.md` — the author's account of what went wrong before this existed, and
