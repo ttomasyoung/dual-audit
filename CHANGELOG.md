@@ -5,6 +5,36 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-08-05
+
+A diagnostic fix. Nothing about what gets audited, or how, changes.
+
+**A lost payload no longer masquerades as a missing field.** When the argument object is too large,
+the host can drop it WHOLE before this driver runs. What surfaced then was `missing task` — so the
+caller went and *added* arguments, growing the payload that was already the problem, and the whole
+loop read as a schema error from beginning to end. `args` absent and `args` present-without-a-task
+are now two different messages, the first of which names size as a known cause and says to move the
+long material into a brief file and pass its path. Every size-related message carries the measured
+size, so nobody has to guess how close they are.
+
+**No limit is enforced, deliberately.** The version of this change that was written first refused
+anything over 2048, and that refusal was withdrawn before release. Two reasons, both worth stating
+because they are the argument against putting it back:
+
+- The size is measured in UTF-16 units. For Latin text those are bytes; for CJK text they are about
+  a third of them (measured: 2.95x). One threshold therefore means two quite different things
+  depending on who is calling — and the author's own payloads were the CJK kind, meaning the limit
+  was miscalibrated for the only person who had it.
+- The cliff is a single anecdote from one operator's log. An independent reviewer tried to reproduce
+  a genuine whole-payload drop and could not, and whether the boundary lives in bytes or in UTF-16
+  units was never established.
+
+A refusal calibrated in an unconfirmed unit against an unreproduced failure cannot be shown to
+prevent what it names, while certainly blocking callers who did nothing wrong. Here the asymmetry
+runs the opposite way from most guards in this project: a false refusal is the expensive outcome,
+and the failure being avoided costs only a confusing message — which the change above already fixes.
+`tests/test_args_size_gate.mjs` keeps the withdrawal honest: reinstating a limit turns it red.
+
 ## [1.0.0] — 2026-08-03
 
 The first two releases published a snapshot. This one publishes what is actually running.
