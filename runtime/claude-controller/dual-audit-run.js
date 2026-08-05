@@ -132,14 +132,65 @@ if (typeof args === 'string') {
   else a = { task: args }
 } else a = (args && typeof args === 'object') ? args : {}
 
+// ── Oversized arguments: report them honestly, do not refuse ─────────────────
+// A large argument object can be dropped WHOLE by the host before this script runs. What then
+// surfaces is not "your payload was too big" but "a required field is missing", which sends the
+// caller off to ADD arguments — growing the payload that was already the problem. The loop is
+// expensive and reads as a schema error from beginning to end.
+//
+// This does two things, both of which are just better reporting:
+//  (a) "the payload never arrived" and "it arrived without a task" become DIFFERENT messages.
+//      Collapsing them into one 'missing task' is what pointed the wrong way in the first place.
+//  (b) every size-related message states the measured size, so the caller can see for themselves
+//      how close they are rather than guessing.
+//
+// WHY THERE IS NO HARD REFUSAL HERE, AND WHY ONE SHOULD NOT BE ADDED WITHOUT NEW MEASUREMENT:
+// an earlier version of this patch refused anything over 2048. It was removed before release,
+// for a reason worth keeping written down:
+//
+//   * The size is measured with `JSON.stringify(...).length`, i.e. in UTF-16 code units. For Latin
+//     text that equals the byte count. For CJK text it is about one THIRD of it (measured: 2.95x).
+//     So a single threshold means two very different things depending on who is calling, and the
+//     author's own payloads were the CJK kind.
+//   * The cliff itself is anecdotal. It comes from one incident in one operator's log. An
+//     independent reviewer tried to reproduce a genuine whole-payload drop and could not, and the
+//     unit it lives in (bytes or UTF-16 units) was never established either.
+//
+// A refusal calibrated in an unconfirmed unit against an unreproduced failure cannot be shown to
+// prevent the thing it names, but will certainly block callers who did nothing wrong. The
+// asymmetry runs the opposite way from most gates in this project: here a false refusal is the
+// expensive outcome and the failure being prevented costs only a confusing message — which (a)
+// already fixes. Establish the unit and reproduce the drop first; then a refusal can be argued for.
+const ARGS_SOFT = 1024
+const argsSize = (() => { try { return JSON.stringify(a || {}).length } catch (e) { return -1 } })()
+const MOVE_TO_BRIEF = 'Put the long material (brief, file lists, quoted sources) in a brief file and '
+  + 'pass only its path, keeping args small. Do NOT add more arguments.'
+
+if (typeof args === 'undefined' || args === null) {
+  return {
+    converged: false, terminal_state: INVALID_AUDIT, rc_diagnostics: [],
+    error: 'No arguments arrived at all. This is usually NOT a missing field — the whole payload '
+         + `failed to parse, and one known cause is that it was too large. ${MOVE_TO_BRIEF}`,
+  }
+}
+
 if (!a.task || !String(a.task).trim()) {
   // rc_diagnostics is an empty array rather than absent, so every exit has the same
   // shape and a caller can read the field unconditionally.
   return {
-    converged: false, terminal_state: INVALID_AUDIT,
-    error: 'missing `task` — say what is being reviewed', rc_diagnostics: [],
+    converged: false, terminal_state: INVALID_AUDIT, rc_diagnostics: [],
+    error: `missing \`task\` — say what is being reviewed. (This call carried ${argsSize} UTF-16 `
+         + `units; if that is large, suspect size before a missing field: ${MOVE_TO_BRIEF})`,
   }
 }
+
+// NOTE: cannot push to `trace` here — it is declared further down and would hit the TDZ.
+// Advisory only. It never changes what runs, so a wrong threshold costs one extra line of output.
+const argsSizeNote = argsSize > ARGS_SOFT
+  ? `args is ${argsSize} UTF-16 units (${ARGS_SOFT}+). Not a problem by itself, but oversized `
+    + `payloads can be dropped whole by the host before this script sees them, and the error you `
+    + `would then get names a missing field instead. ${MOVE_TO_BRIEF}`
+  : null
 
 // Forward EVERY caller argument except the three handshake keys. The panel's
 // fingerprint binds all arguments except those, so an allowlist here would drop
@@ -236,6 +287,7 @@ let calls = 0
 const rcDiagnostics = []
 let lastPanelResult = null
 const trace = []
+if (argsSizeNote) trace.push(argsSizeNote)
 
 phase('Dual audit')
 
