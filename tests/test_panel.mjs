@@ -124,6 +124,27 @@ const CA_NODIGIT = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: looks good structurall
 const R1nd = (await runPanel(BSRC, async () => CA_NODIGIT)).r
 const A1nd = R1nd.task_fingerprint + '_r1'
 const psNoStance = { ...ps2 }; delete psNoStance.prev_round_stance  // round-2 prior state with prev_round_stance removed
+// ==== deep-mode parallel chain: the ONLY fixtures that may assert a round-3 handoff ====
+// 🔴 Why a whole separate chain instead of adding mode:'deep' to the four cases below.
+//    The default allowance is TWO rounds. Under it there is no third round to open, so an
+//    anti-flip refusal terminates as not_converged and the round-3 handoff — and the total
+//    budget ceiling that guards it — are never reached. Those paths would silently stop being
+//    tested.
+//    But `mode` is part of the audit fingerprint, by design: a prior_state produced under one
+//    mode is a DIFFERENT audit from a call made under another, and the panel refuses the mix
+//    (prior_state_identity_mismatch). Measured: pinning deep on the final call alone turns all
+//    four red for that reason. So the whole chain — round 1, the round-2 state, and the AUDIT-IDs
+//    derived from its fingerprint — has to be built under deep as well.
+// ⚠️ Do NOT "simplify" this by relaxing the four expectations to not_converged. That is green for
+//    the wrong reason: it drops coverage of the handoff path and of the ceiling guard entirely.
+const BDEEP  = { ...BSRC, mode: 'deep' }
+const R1D    = (await runPanel(BDEEP, async () => CLAUDE_APPROVE)).r
+const FPD    = R1D.task_fingerprint, A1D = FPD + '_r1', A2D = FPD + '_r2'
+const ps2D   = (await runPanel({ ...BDEEP, prior_state: R1D.prior_state, codex_prev_verdict_raw: cxCleanReject(A1D), codex_exit_code: 0 }, async () => CLAUDE_APPROVE)).r.prior_state
+const R1crD  = (await runPanel(BDEEP, async () => CLAUDE_CLEAN_R)).r
+const A1crD  = R1crD.task_fingerprint + '_r1'
+const R2crD  = (await runPanel({ ...BDEEP, prior_state: R1crD.prior_state, codex_prev_verdict_raw: cxApprove(A1crD), codex_exit_code: 0 }, async () => CA_DELTA)).r
+const psNoStanceD = { ...ps2D }; delete psNoStanceD.prev_round_stance
 // ==== Claim-mode fixtures. Without these, every case would be code mode and the claim gates would never run. ====
 const B_BIO = { task: 'judge a classification claim', kind: 'claim', contextPack: { raw_sources: ['/tmp/x.fasta'], canonical_docs: ['/tmp/canon.md'] } }
 const CLAIM_A = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: 4 samples match the reference batch\nANCHOR: anchored\nUNANCHORED_CLAIMS: none\nEND'
@@ -170,7 +191,7 @@ const CASES_B = [
   { n: 'B9 frozen round 1 missing',          args: { ...BSRC, prior_state: psNoFrozen, codex_prev_verdict_raw: cxApprove(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'prior_state_frozen_r1_missing', g: 'if (prior && priorRoundValid && priorRound >= 2 && !frozenOk) {', gf: 'if (false) {' },
   // B10: the reviewer rejects in round 1 and approves in round 2 with a DELTA (so the delta gate is not
   // what blocks). The flip-stability gate must block; removing it converges falsely.
-  { n: 'B10 anti-flip: reviewer flipped',   args: { ...BSRC, prior_state: ps2, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (codexFreshFlipHard) {', gf: 'if (false) {' },
+  { n: 'B10 anti-flip: reviewer flipped',   args: { ...BDEEP, prior_state: ps2D, codex_prev_verdict_raw: cxApproveDelta(A2D), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (codexFreshFlipHard) {', gf: 'if (false) {' },
   // B11: a cumulative budget already at the ceiling means this round would exceed it, so it is refused
   // before convergence rather than after.
   { n: 'B11 budget over the hard ceiling',          args: { ...BSRC, prior_state: { ...ps2, cumulative_used: 18 }, codex_prev_verdict_raw: cxApprove(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && (r.blockers || []).some(b => /HARD_TOTAL_CEILING.*exceeded/.test(b)), g: 'if (ledger.totalUsed > HARD_TOTAL_CEILING) {', gf: 'if (false) {' },
@@ -190,18 +211,18 @@ const CASES_B = [
   { n: 'B18 reviewer verdict with no VERDICT fails identity',        args: { ...R2ok, codex_prev_verdict_raw: cxNoVerdict(A1) },  fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'codex_verdict_identity_mismatch' },
   // B19 is the Claude-side anti-flip: round 1 rejects, round 2 approves with a DELTA (a genuine flip)
   // while the reviewer approves throughout, so the Claude flip gate must block. Removing it converges falsely.
-  { n: 'B19 anti-flip: Claude side flipped',   args: { ...BSRC, prior_state: R2cr.prior_state, codex_prev_verdict_raw: cxApprove(R1cr.task_fingerprint + '_r2'), codex_exit_code: 0 }, fn: () => CA_DELTA, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (claudeFreshFlipHard) {', gf: 'if (false) {' },
+  { n: 'B19 anti-flip: Claude side flipped',   args: { ...BDEEP, prior_state: R2crD.prior_state, codex_prev_verdict_raw: cxApprove(R1crD.task_fingerprint + '_r2'), codex_exit_code: 0 }, fn: () => CA_DELTA, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (claudeFreshFlipHard) {', gf: 'if (false) {' },
   // ==== The remaining live exits ====
   // B20: consecutive unavailable reviewer attempts reach the cap and escalate, which is different from
   // the single-attempt retry cases above.
   { n: 'B20 codex_unavailable escalate', args: { ...BSRC, prior_state: { ...R1.prior_state, codex_unavailable_streak: 1 }, codex_prev_verdict_raw: cxApprove(A1), codex_exit_code: 1 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'codex_unavailable', g: 'if (streak >= MAX_CODEX_UNAVAIL) {', gf: 'if (false) {' },
   // B21: the TOTAL budget is exhausted when a new round would open, which is a different exit from B11.
-  { n: 'B21 hard ceiling blocks opening another round', args: { ...BSRC, prior_state: { ...ps2, cumulative_used: 17 }, codex_prev_verdict_raw: cxCleanReject(A2), codex_exit_code: 0 }, fn: () => CLAUDE_CLEAN_R, ok: r => r.converged === false && (r.blockers || []).some(b => /HARD_TOTAL_CEILING.*reached/.test(b)), g: 'if (ledger.totalUsed >= HARD_TOTAL_CEILING) {   // P0-3', gf: 'if (false) {   // P0-3' },
+  { n: 'B21 hard ceiling blocks opening another round', args: { ...BDEEP, prior_state: { ...ps2D, cumulative_used: 17 }, codex_prev_verdict_raw: cxCleanReject(A2D), codex_exit_code: 0 }, fn: () => CLAUDE_CLEAN_R, ok: r => r.converged === false && (r.blockers || []).some(b => /HARD_TOTAL_CEILING.*reached/.test(b)), g: 'if (ledger.totalUsed >= HARD_TOTAL_CEILING) {   // P0-3', gf: 'if (false) {   // P0-3' },
   // B22: at round 2 or later a missing prev_round_stance must be refused. The fixture gives the reviewer a
   // DELTA (so the delta gate is not what blocks) and keeps the Claude side stably approving (so the flip
   // gate is not what blocks), which leaves the missing-state guard as the ONLY thing that can block —
   // otherwise another gate would mask it and the mutant would look killed when it was not.
-  { n: 'B22 missing prev_round_stance is refused', args: { ...BSRC, prior_state: psNoStance, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (priorRound >= 2 && !prevStanceUsable) {', gf: 'if (false) {' },
+  { n: 'B22 missing prev_round_stance is refused', args: { ...BDEEP, prior_state: psNoStanceD, codex_prev_verdict_raw: cxApproveDelta(A2D), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'r3_handoff_to_codex', g: 'if (priorRound >= 2 && !prevStanceUsable) {', gf: 'if (false) {' },
   // B25: a blocker reachable only by reading a value the gates never consult must not converge. The
   // reviewer is told verbatim that anything outside the field shapes is refused rather than
   // reinterpreted; until this gate existed the parser only warned and the round approved.
@@ -411,8 +432,10 @@ console.log('=== Group D: single load-bearing convergence and parsing gates ==='
   const R1vf = (await runPanel(BSRC, async () => CA_VFAIL)).r
   // The delta-gate chain at round 3: a flip that IS stable across two rounds but arrives without a DELTA,
   // which is a different failure from the flip gate. The reviewer chain and the Claude chain are symmetric.
-  const ps3c  = (await runPanel({ ...BSRC, prior_state: ps2, codex_prev_verdict_raw: cxApproveDelta(A2), codex_exit_code: 0 }, () => CLAUDE_APPROVE)).r
-  const ps3cl = (await runPanel({ ...BSRC, prior_state: R2cr.prior_state, codex_prev_verdict_raw: cxApprove(R1cr.task_fingerprint + '_r2'), codex_exit_code: 0 }, () => CA_NODELTA)).r
+  // Round 3 only exists under deep (see the deep-mode parallel chain above): the default
+  // allowance is two rounds, so this state and the delta-gate cases below must be built there.
+  const ps3c  = (await runPanel({ ...BDEEP, prior_state: ps2D, codex_prev_verdict_raw: cxApproveDelta(A2D), codex_exit_code: 0 }, () => CLAUDE_APPROVE)).r
+  const ps3cl = (await runPanel({ ...BDEEP, prior_state: R2crD.prior_state, codex_prev_verdict_raw: cxApprove(R1crD.task_fingerprint + '_r2'), codex_exit_code: 0 }, () => CA_NODELTA)).r
   const okPend = r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex'
   const DCASES = [
     { n: 'D1 approving while VERIFIED says fail is blocked', args: { ...BSRC, prior_state: R1vf.prior_state, codex_prev_verdict_raw: cxApprove(R1vf.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: okPend, g: 'if (codeGap) blockers.push(codeGap)', gf: 'if (false) blockers.push(codeGap)' },
@@ -431,8 +454,8 @@ console.log('=== Group D: single load-bearing convergence and parsing gates ==='
     { n: 'D6 claim mode requires UNANCHORED_CLAIMS to be present', args: { ...B_BIO, prior_state: R1bio.prior_state, codex_prev_verdict_raw: cxClaimNoUn(R1bio.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAIM_A, ok: okPend, g: 'unanchoredList !== null', gf: 'true' },
     { n: 'D7 a truncated VERDICT appended after the block is refused', args: { ...R2ok, codex_prev_verdict_raw: cxTrunc(A1) }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'codex_verdict_identity_mismatch', g: 'if (splitLines(tail).some(', gf: 'if (false && splitLines(tail).some(' },
     { n: 'D8 a placeholder inside the block is refused even with a digit present', args: { ...R2ok, codex_prev_verdict_raw: cxPHd(A1) }, fn: () => CLAUDE_APPROVE, ok: okPend, g: '!placeholderInBlock', gf: 'true' },
-    { n: 'D9 delta gate: a round-3 reviewer flip against frozen round 1 without a DELTA', args: { ...BSRC, prior_state: ps3c.prior_state, codex_prev_verdict_raw: cxApprove(ps3c.prior_state.task_fingerprint + '_r3'), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && (r.gate_codes || []).includes('DELTA-GATE:codex'), g: 'if (codexFlippedUp && deltaMissingOrExplicitlyUnchanged) {', gf: 'if (false) {' },
-    { n: 'D10 delta gate: a round-3 Claude flip against frozen round 1 without a DELTA', args: { ...BSRC, prior_state: ps3cl.prior_state, codex_prev_verdict_raw: cxApprove(ps3cl.prior_state.task_fingerprint + '_r3'), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && (r.gate_codes || []).includes('DELTA-GATE:claude'), g: 'if (claudeFlippedUp && !claudeGaveNonEmptyDelta) {', gf: 'if (false) {' },
+    { n: 'D9 delta gate: a round-3 reviewer flip against frozen round 1 without a DELTA', args: { ...BDEEP, prior_state: ps3c.prior_state, codex_prev_verdict_raw: cxApprove(ps3c.prior_state.task_fingerprint + '_r3'), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && (r.gate_codes || []).includes('DELTA-GATE:codex'), g: 'if (codexFlippedUp && deltaMissingOrExplicitlyUnchanged) {', gf: 'if (false) {' },
+    { n: 'D10 delta gate: a round-3 Claude flip against frozen round 1 without a DELTA', args: { ...BDEEP, prior_state: ps3cl.prior_state, codex_prev_verdict_raw: cxApprove(ps3cl.prior_state.task_fingerprint + '_r3'), codex_exit_code: 0 }, fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && (r.gate_codes || []).includes('DELTA-GATE:claude'), g: 'if (claudeFlippedUp && !claudeGaveNonEmptyDelta) {', gf: 'if (false) {' },
   ]
   for (const c of DCASES) { const { r } = await runPanel(c.args, c.fn).catch(e => ({ r: { __throw: e.message } })); rec(!r.__throw && c.ok(r), c.n, r.__throw || `converged=${r.converged} status=${r.convergence_status}`) }
   for (const c of DCASES) { const k = await mutKill(c.args, c.fn, c.ok, c.g, c.gf, true); if (k.threw) threwNote++; rec(k.kill, c.n + '[mut]' + (k.threw ? '(crashed)' : ''), k.why) }  // requireConverged=true: only a mutant that actually converges counts as a clean kill here
