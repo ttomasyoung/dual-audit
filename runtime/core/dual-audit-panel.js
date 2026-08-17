@@ -81,13 +81,22 @@ if (KIND === null) {
 }
 // Same treatment for mode: 'quick2' used to fall silently to adaptive, i.e. a caller asking for ONE
 // round would silently get three (about 81 minutes instead of 15) with nothing said.
-const MODE_VALID = ['quick', 'standard', 'deep', 'adaptive']
+// codex_only: ONE codex seat, ZERO Claude seats, one round. Half of `quick` — an independent
+// second reader without the Claude side, for when that is all the situation calls for.
+// Same input contract and same output contract as every other mode, so nothing downstream
+// (triage, reminders, terminal_state handling) needs a special case for it.
+// The convergence gate needed NO change for this: `valid` already includes the codex verdict
+// (see evaluateConvergence), so with zero Claude seats a valid codex verdict still satisfies
+// `!valid.length` and is still subject to `valid.every(approves)`. The only thing that changes
+// is seat composition.
+const MODE_VALID = ['quick', 'standard', 'deep', 'adaptive', 'codex_only']
 const MODE_RAW = norm(input.mode, 'adaptive')
 if (!MODE_VALID.includes(MODE_RAW)) {
   return {
     converged: false,
     error: `mode '${MODE_RAW}' is not a recognised mode. Valid: ${MODE_VALID.join(' | ')}.`
-      + ` quick = 1 round; standard / deep / adaptive = 3 rounds (they are currently identical).`,
+      + ` quick = 1 round; standard / adaptive = 2 rounds; deep = 3 rounds;`
+      + ` codex_only = 1 round with NO Claude seats (codex verdict only).`,
     note: 'Refused rather than falling back. An unrecognised mode used to fall silently to adaptive, so a'
       + ' caller asking for a single round would silently be charged three.',
     mode_received: MODE_RAW,
@@ -302,7 +311,26 @@ const isRealSourcePath = (p) =>
 const PROFILE = {"version":1,"name":"default","customized":false,"projects":[],"evidence":{"brief_note":""},"profile_sha256":null}
 // <<< END DUAL-AUDIT PROFILE <<<
 
-const MODE_ROUNDS = { quick: 1, standard: 3, deep: 3, adaptive: 3 }
+// SYNC-GROUP: dual-audit-rounds  (this value also lives in the driver and in the operator docs)
+// Three tiers, picked by the operator according to the size of the problem:
+//   quick = 1 round, standard/adaptive = 2, deep = 3.
+//
+// 🔴 The default of 2 is NOT an attempt to reach converged=true. This panel does not exist to
+//    converge; it exists to get independent readings of the same system, and a run that ends
+//    not-converged is a normal outcome rather than a fault.
+//    What the second round buys is CROSS-EXAMINATION. A single round routinely produces a
+//    confident finding that a second reader dismantles: an extrapolated cost measured on a
+//    synthetic fixture whose shape differs from the real input; a finding whose CONCLUSION is
+//    right while its probe landed somewhere the code excludes, so the stated damage chain does
+//    not hold until the probe is re-anchored. Round 2 fixes the real ones in place and drops
+//    the rest, which means LESS human arbitration, not more.
+//
+//    Consequence, known and accepted: with standard=2 the flip-stability gate below ("a verdict
+//    that flips in the LAST round does not count as convergence") will fire more often. That is
+//    the correct outcome — a last-round reversal is exactly the case a human should look at, and
+//    escalate_to_user is a terminal state, not a malfunction. Do NOT raise the round count to
+//    make that gate quiet.
+const MODE_ROUNDS = { quick: 1, standard: 2, adaptive: 2, deep: 3, codex_only: 1 }
 const roundsAllowed = Math.min(MAX_ROUNDS, MODE_ROUNDS[MODE])
 // claimMode: the submission contains NON-CODE FACTUAL CLAIMS. It gates exactly the same five
 // things it did before the rename: ANCHOR/UNANCHORED_CLAIMS required; both fields in the validity
@@ -323,13 +351,27 @@ const CODEX_MODE = (norm(input.codex_mode, 'deferred') === 'forward') ? 'forward
 if (!TASK) return { converged: false, error: 'dual-audit-panel needs a non-empty task. Pass a string or {task, context, project, risk, kind, mode, contextPack}.' }
 
 // ---- R3: context-pack required fields, fail-closed for code / high-risk ----
-const fmt = (v) => Array.isArray(v) ? v.join('; ') : String(v)
+// Objects are valid for structured acceptance contracts. String(object) destroys every key as
+// "[object Object]" while the presence gate still treats it as supplied — a fail-open contract.
+// Preserve structured values as JSON; cyclic/non-serializable values format to empty and are
+// rejected by fieldEmpty below.
+const fmt = (v) => {
+  if (Array.isArray(v) && v.every(x => x == null || ['string', 'number', 'boolean'].includes(typeof x))) {
+    return v.join('; ')
+  }
+  if (v != null && typeof v === 'object') {
+    try { return JSON.stringify(v) }
+    catch { return '' }
+  }
+  return String(v)
+}
 // `!CP.targets` was a truthiness test, and an empty array is truthy - so `targets: []` or a
 //   whitespace-only string counted as PROVIDED, skipped the missing-field check, and a code audit
 //   with no real target still converged through the VERIFIED gates on both sides. fieldEmpty treats
 const fieldEmpty = (v) => v == null
   || (typeof v === 'string' && v.trim() === '')
   || (Array.isArray(v) && v.filter(x => !(x == null || String(x).trim() === '')).length === 0)
+  || (!Array.isArray(v) && typeof v === 'object' && (fmt(v) === '' || fmt(v) === '{}'))
 const missing = []
 if (codeRelevant) { if (fieldEmpty(CP.targets)) missing.push('contextPack.targets (files/scripts to verify)'); if (fieldEmpty(CP.expected)) missing.push('contextPack.expected (expected outputs/columns/counts to check against)') }
 // 🔴 Profile fields are read with strField, never with String(). A profile is hand-written YAML, so
@@ -410,13 +452,50 @@ const rawSourcesAll = (() => {
 })()
 const rawSourcesExcluded = rawSourcesAll.filter(p => generatedByClaude.includes(p))
 const rawSources = rawSourcesAll.filter(p => !generatedByClaude.includes(p))
+// R1 provenance exclusion is deliberately temporary. In R2+ the independent seat must inspect the
+// actual submitted target in order to adjudicate whether a reported defect was fixed. Only generated
+// TARGETS are restored here — never the lead's CONTEXT, summary, conclusion, or arbitrary generated
+// support material. This keeps R1 independent without making cross-examination permanently blind.
+const generatedTargetsForCrossExam = cleanList(CP.targets).filter(p => generatedByClaude.includes(p))
+const crossExamSources = [...new Set(rawSources.concat(generatedTargetsForCrossExam))]
 // NOTE (corrected by whole-flow audit): the earlier claim "line-62 validation guarantees a readable
 // source so no empty-rawSources guard is needed" was WRONG — validation checks canonical_docs PRESENCE, which
 // passes even when every canonical_doc is generated_by_claude (post-filter → []) on an unknown project, leaving
 // the independent R1 with nothing to read yet still able to converge. The real guard is `hasIndependentR1Source`
 // (below) + the STEP-B fail-closed when it is false. The FILTER here is the provenance (P1-b) fix.
+// ---- TASK BRIEF ----
+// `contextPack.brief` used to be accepted by the schema and then consumed by nothing. The
+// read-allowlist was built from `contextPack.targets` alone, so a caller could pass a brief,
+// have it validated, and watch the codex seat be handed a task that refers to sections of a
+// document it is not allowed to open. Observed exactly that: the seat reported it could not
+// adjudicate the questions it had been asked and, following its own coverage discipline,
+// declined to issue a converging verdict. The Claude seats in the same round HAD read the
+// brief and did adjudicate. The two sides were working from different material — and the
+// entire value of an independent round 1 rests on both sides reading the raw inputs
+// themselves. Asymmetric material makes that independence claim empty.
+//
+// 🔴 Why this is its own category and NOT folded into RAW SOURCES:
+//    The brief is a STATEMENT OF WORK — what to review, what the discipline boundaries are,
+//    what must not be reopened. It is not evidence. It is written by the submitting party and
+//    necessarily carries that party's conclusions and self-assessment. Folding it into RAW
+//    SOURCES would hollow out "read the raw material independently"; withholding it entirely
+//    leaves the seat unsure what it is even reviewing. So it is supplied, with its provenance
+//    stated verbatim: read it for scope, do not treat it as evidence.
+//    ⚠️ It deliberately does NOT count toward hasIndependentR1Source — a brief can never
+//       substitute for a genuinely independent source.
+const taskBriefPath = (typeof CP.brief === 'string' && CP.brief.trim().startsWith('/'))
+  ? CP.brief.trim() : ''
+const taskBriefNote = taskBriefPath
+  ? `TASK BRIEF — read this FIRST to learn WHAT to audit and WHICH disciplines apply:\n  - ${taskBriefPath}\n`
+    + `  \u26a0 PROVENANCE: written by the SUBMITTING agent. Its conclusions, self-assessment and `
+    + `"already fixed" claims are NOT evidence. Read it for scope / questions / rules, then verify `
+    + `everything yourself against RAW SOURCES and TARGETS.`
+  : ''
 const rawSourcesNote = rawSources.length
   ? `RAW SOURCES — read ONLY these (read them yourself):\n${rawSources.map(s => '  - ' + s).join('\n')}` + (rawSourcesExcluded.length ? `\n(${rawSourcesExcluded.length} Claude-generated path(s) were EXCLUDED from this independent allowlist by provenance.)` : '')
+  : ''
+const crossExamSourcesNote = crossExamSources.length
+  ? `CROSS-EXAM SOURCES — read ONLY these in R2+ (read the submitted targets yourself):\n${crossExamSources.map(s => '  - ' + s).join('\n')}`
   : ''
 // 🔴 The time box is a DEFAULT FIELD of every brief, not something the caller writes by hand.
 //    Measured incident: a reviewer spent ten minutes reading a project's whole control-plane
@@ -431,7 +510,7 @@ const rawSourcesNote = rawSources.length
 //    So the honest instruction is not "be efficient" - it is "a partial verdict beats no verdict".
 const TIME_BOX_MIN = 8
 const boundedScopeNote = [
-  'BOUNDED SCOPE (mandatory): read ONLY the files/paths listed above (RAW SOURCES / PROJECT docs / CANONICAL DOCS).',
+  'BOUNDED SCOPE (mandatory): read ONLY the files/paths listed above (TASK BRIEF / RAW SOURCES / CROSS-EXAM SOURCES / PROJECT docs / CANONICAL DOCS).',
   'Do NOT grep/rg/find across other directories, other sessions, unrelated project histories, or *-backup copies — that pollutes your judgment and wastes your turn (this exact failure killed a prior run on timeout).',
   `TIME BOX (hard, ${TIME_BOX_MIN} minutes): your process is killed at a fixed wall-clock ceiling you cannot raise, and a killed run returns NOTHING — no verdict, no partial findings, no error.`,
   'Therefore: budget your reading, and EMIT A VERDICT even if your review is incomplete — your partial findings are worth keeping.',
@@ -479,7 +558,21 @@ const HEADER_RAW = [
   canonicalDocsForR1.length ? `CANONICAL DOCS (read them yourself; source of truth): ${canonicalDocsForR1.join('; ')}` : '',
   CP.expected ? `EXPECTED OUTPUT CONTRACT: ${fmt(CP.expected)}` : '',
   CP.forbidden_write_paths ? `FORBIDDEN WRITE PATHS (NEVER write here): ${fmt(CP.forbidden_write_paths)}` : '',
+  taskBriefNote,
   rawSourcesNote,
+].filter(Boolean).join('\n')
+// R2+ stays neutral (no lead-authored CONTEXT or conclusions) but restores submitted generated
+// targets so the independent seat can personally inspect the fix it is cross-examining.
+const HEADER_CROSS = [
+  `TASK: ${TASK}`,
+  USER_RAW ? `USER (verbatim): ${USER_RAW}` : '',
+  projectDocNote,
+  PROFILE_BRIEF_NOTE,
+  canonicalDocsForR1.length ? `CANONICAL DOCS (read them yourself; source of truth): ${canonicalDocsForR1.join('; ')}` : '',
+  CP.expected ? `EXPECTED OUTPUT CONTRACT: ${fmt(CP.expected)}` : '',
+  CP.forbidden_write_paths ? `FORBIDDEN WRITE PATHS (NEVER write here): ${fmt(CP.forbidden_write_paths)}` : '',
+  taskBriefNote,
+  crossExamSourcesNote,
 ].filter(Boolean).join('\n')
 
 // ---- Two-phase handshake state (one round per invocation) ----
@@ -1434,7 +1527,8 @@ function rawSourceBrief() {
 }
 
 // ---- R2+ SHARING Codex brief: both sides see each others' frozen R1 raw verdicts + cross-examine ----
-// Uses HEADER_RAW (NOT HEADER): R2 shares the frozen R1 VERDICTS explicitly, but must NOT silently
+// Uses HEADER_CROSS (NOT HEADER): R2 shares frozen R1 verdicts and restores submitted targets, but
+// must NOT silently
 // re-inject Claude's CONTEXT narrative / the profile's canonical conclusions, which would dilute
 // cross-examination neutrality (P1, Claude-side finding). (No worker output — pure review panel.)
 function sharedCodexBrief(n, shared, openP0s) {
@@ -1445,7 +1539,7 @@ function sharedCodexBrief(n, shared, openP0s) {
     shared.prevCodexRaw || '(none)',
   ] : []
   return [
-    HEADER_RAW,
+    HEADER_CROSS,
     `AUDIT-ID: ${auditIdFor(n)}`,
     'MANDATORY: reproduce the AUDIT-ID line above VERBATIM inside your verdict block. A verdict that omits it, or carries a different id, is REFUSED and never merged (cross-project safety when two audits run concurrently).',
     `You are the READ-ONLY auditor (second model, gpt/codex) in ROUND ${n} — the CROSS-EXAMINATION phase. You CANNOT write anywhere.`,
@@ -1516,7 +1610,12 @@ async function runClaudeRound(n, openP0s, shared) {
   //  * Lenses used to fork on claim vs non-claim; merging them fixed the case where non-claim
   //    submissions never saw the evidence-chain lens and claim submissions never saw the
   //    method-and-reasoning lens - neither question depends on the subject matter.
-  const specs = SEAT_SPECS.map(keys => ({ keys, kind: 'claude' }))
+  // codex_only: zero Claude seats. Everything downstream already tolerates this —
+  // anyNull becomes [].some() === false, auditors becomes [], and the `no valid auditor verdict`
+  // blocker is satisfied by the codex verdict because evaluateConvergence pushes codex into
+  // the same `valid` array. Do NOT special-case the convergence gate for this mode: the whole
+  // point is that a codex-only run is held to the SAME bar, just with one fewer perspective.
+  const specs = MODE === 'codex_only' ? [] : SEAT_SPECS.map(keys => ({ keys, kind: 'claude' }))
 
   const thunks = specs.map(s => () => {
     const tag = `r${rs.n}_${s.kind}_${(s.keys || ['all']).join('')}`

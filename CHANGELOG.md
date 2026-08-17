@@ -5,6 +5,65 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.1.0]
+
+One new mode, one changed default, and one field that was accepted and then ignored.
+
+**`standard` and `adaptive` are now two rounds, not three.** This is a behaviour change for
+anyone relying on the old default, and the reasoning matters more than the number.
+
+This panel does not exist to converge. Across a long run of real audits the three-round setting
+reached `converged: true` rarely, and treating that as a defect led to the wrong repairs — raising
+the round count to quiet a gate, or reading `escalate_to_user` as a malfunction. It is not one. The
+panel's product is *independent readings of the same system*, and two independent readers of
+anything non-trivial will usually still disagree about something at the end.
+
+What the second round actually buys is cross-examination, and that is worth paying for. A single
+round routinely produces a confident finding that a second reader takes apart: a cost extrapolated
+from a synthetic fixture whose shape differs from the real input; a finding whose *conclusion* is
+correct while its probe landed somewhere the code already excludes, so the stated damage chain does
+not hold until the probe is re-anchored. Round two pins the real findings down and drops the rest,
+which means **less** human arbitration, not more. The third round, in practice, mostly bought
+another lap.
+
+Known and accepted consequence: with two rounds the flip-stability gate — a verdict that flips in
+the *last* round does not count as convergence — fires more often. That is the correct outcome. A
+last-round reversal is exactly the case a human should look at. Do not raise the round count to
+make that gate quiet; that is the trade the old default was making without saying so.
+
+**New mode: `codex_only`.** One codex seat, zero Claude seats, one round — half of `quick`. For
+when an independent second reader is all the situation calls for and a full panel is not warranted.
+
+It takes the same input contract and produces the same output contract as every other mode, so
+nothing downstream needs a special case for it. Notably, the convergence gate needed **no** change:
+the codex verdict was already pushed into the same `valid` collection as the Claude verdicts, so
+with zero Claude seats a valid codex verdict still satisfies the "no valid auditor verdict" check
+and is still subject to the requirement that every valid verdict approve. It is deliberately held
+to the same bar as a full panel — it simply has one fewer perspective. No convergence shortcut was
+added for it, and none should be.
+
+⚠️ Disclosed rather than glossed: `codex_only` has been verified structurally (mode accepted, one
+round, zero seats, other modes unaffected, and the zero-seat case correctly reports "not all valid
+auditors approve" rather than falsely reporting "no valid auditor verdict") but has **not** been
+exercised end-to-end against a live reviewer.
+
+**`contextPack.brief` now reaches the reviewers.** It was accepted by the schema and consumed by
+nothing. The read-allowlist was built from `contextPack.targets` alone, so a caller could pass a
+brief, have it validated, and then watch a seat be handed a task referring to sections of a
+document it was not permitted to open. That is what happened: the seat reported it could not
+adjudicate the questions it had been asked and, following its own coverage discipline, declined to
+issue a converging verdict — while the seats on the other side had read the brief and did
+adjudicate. The two sides were working from different material, and the entire value of an
+independent first round rests on both sides reading the raw inputs themselves.
+
+It is delivered as its **own** category, not folded into raw sources. A brief is a statement of
+work — what to review, where the boundaries are, what must not be reopened. It is not evidence: it
+is written by the submitting party and necessarily carries that party's conclusions and
+self-assessment. Folding it in would hollow out "read the raw material independently"; withholding
+it entirely leaves the reviewer unsure what it is reviewing. So it is supplied with its provenance
+stated verbatim, and it deliberately does **not** count toward the check that a genuinely
+independent source exists. A brief can never substitute for one.
+
 ## [1.0.1] — 2026-08-05
 
 A diagnostic fix. Nothing about what gets audited, or how, changes.
