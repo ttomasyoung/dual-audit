@@ -5,6 +5,28 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.1.1]
+
+`codex_only` did not work end to end. 1.1.0 shipped it verified structurally — the mode was
+accepted, one round was allowed, zero Claude seats were dispatched, other modes were unaffected —
+and that was disclosed at the time as not having been exercised against a live reviewer. It had
+not, and it was broken.
+
+The round-2 state check requires `prior_state.claude_verdicts_raw` to be non-empty. That check
+exists to catch a Claude side that was truncated or silently dropped; its own message names the
+danger, "the round is decided by the codex verdict alone (not a dual audit)". Under `codex_only`
+that is not a degradation — it is the mode the caller asked for. So the reviewer produced a
+verdict, exit code 0, and the panel discarded it at the handoff.
+
+The emptiness requirement is now lifted for `codex_only` alone. Everything else still applies: an
+array that is present must still parse and must still match its declared count. The exemption
+cannot be borrowed by another mode, because `mode` is part of the audit fingerprint — a
+`prior_state` produced by a dual-mode run is a different audit and is refused by the identity
+check long before reaching this point.
+
+Verified end to end this time: a `codex_only` run reached the reviewer, took its verdict, and
+returned a real terminal state instead of a state-schema abort.
+
 ## [1.1.0]
 
 One new mode, one changed default, and one field that was accepted and then ignored.

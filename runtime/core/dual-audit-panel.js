@@ -1947,11 +1947,24 @@ const hasClaudeCountKey = !!(prior && Object.prototype.hasOwnProperty.call(prior
 const claudeCountRaw = hasClaudeCountKey ? prior.claude_verdicts_count : undefined
 const claudeCountValid = !hasClaudeCountKey || (typeof claudeCountRaw === 'number' && Number.isInteger(claudeCountRaw) && claudeCountRaw >= 0)
 const claudeCountDeclared = (hasClaudeCountKey && claudeCountValid) ? claudeCountRaw : null
-const claudeVerdictsOk = !prior ? true : !!(claudeArr &&
-  claudeArr.length > 0 &&
-  claudeArr.some(v => typeof v === 'string' && parseSentinel(v).valid) &&
-  claudeCountValid &&
-  (claudeCountDeclared === null || claudeArr.length === claudeCountDeclared))
+// 🔴 codex_only: a Claude side is absent BY DESIGN, so "non-empty" cannot be required of it.
+//    This check exists to catch a Claude side that was TRUNCATED or silently dropped — its own
+//    message names the danger: "the round is decided by the codex verdict alone (not a dual
+//    audit)". Under codex_only that is not a degradation, it is the mode the caller asked for.
+//    The exemption is safe to scope this narrowly because `mode` is part of the audit
+//    fingerprint: a prior_state produced by a dual-mode run is a DIFFERENT audit and is refused
+//    by the identity check long before reaching here, so no other mode can borrow this path.
+//    ⚠️ Everything else still applies — an array that is present must still parse and must still
+//    match its declared count. Only the emptiness requirement is lifted, and only here.
+const claudeSideOptional = (MODE === 'codex_only')
+const claudeVerdictsOk = !prior ? true : (
+  (claudeSideOptional && claudeArr && claudeArr.length === 0 &&
+    claudeCountValid && (claudeCountDeclared === null || claudeCountDeclared === 0))
+  || !!(claudeArr &&
+    claudeArr.length > 0 &&
+    claudeArr.some(v => typeof v === 'string' && parseSentinel(v).valid) &&
+    claudeCountValid &&
+    (claudeCountDeclared === null || claudeArr.length === claudeCountDeclared)))
 // HARD CUT: after workers were removed this panel's state no longer carries worker_output /
 // worker_parsed. A prior_state containing any worker field comes from the pre-removal panel and is
 // schema-incompatible - report an explicit error and require a fresh run rather than silently
