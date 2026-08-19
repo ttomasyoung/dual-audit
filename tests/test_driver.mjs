@@ -171,6 +171,19 @@ await t('A11 pending but no prior_state -> INFRASTRUCTURE_BLOCKED',
   (m) => runDriver({ panelReplies: [{ audit_stage: 'r1_pending_codex', codex_brief: 'b' }], agentReply: block(0), mutate: m }),
   (r) => r.terminal_state === 'INFRASTRUCTURE_BLOCKED')
 
+// A single-seat run converged on ONE reviewer with no cross-examination. Mapping it to plain
+// CONVERGED made it machine-identical to a dual audit: the prose said "single seat" and nothing
+// that branches reads prose.
+await t('A11d a single-seat convergence does NOT map to CONVERGED',
+  (m) => runDriver({ panelReplies: [{ converged: true, audit_stage: 'converged_r2',
+    convergence_status: 'converged_single_seat' }], mutate: m }),
+  (r) => r.terminal_state === 'CONVERGED_SINGLE_SEAT')
+
+await t('A11e a real dual-audit convergence still maps to CONVERGED (or the fix just breaks approval)',
+  (m) => runDriver({ panelReplies: [{ converged: true, audit_stage: 'converged_r2',
+    convergence_status: 'converged' }], mutate: m }),
+  (r) => r.terminal_state === 'CONVERGED')
+
 // A refusal of a corrupt handshake adjudicated NOTHING. Every sibling prior_state_* abort is in
 // INVALID_STATUSES; a new one that is not gets classified as a substantive non-convergence, and the
 // consumer is then handed unresolved_p0 inherited verbatim from the state that was just refused.

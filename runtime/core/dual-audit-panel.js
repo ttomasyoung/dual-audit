@@ -1928,7 +1928,17 @@ const shapeAbort = (statusName, why, fix) => ({
   ...resultBase, rounds_run: priorRound, converged: false,
   audit_stage: 'escalate_to_user', convergence_status: statusName,
   needs_expert_signoff: false,
-  blockers: [why],
+  // 🔴 AUDIT panel-self-triage-0819 — refusing a corrupt state is right: having just declared
+  // it untrustworthy, re-parsing another part of it would be worse.  But saying NOTHING about
+  // what it carried lets the reader conclude nothing was ever found.  Count them without
+  // trusting their content: a count is not an adjudication.
+  blockers: [why].concat((() => {
+    try {
+      const raw = (prior && prior.claude_verdicts_raw) || []
+      const n = (Array.isArray(raw) ? raw : []).reduce((k, t) => k + (/^P0:\s*(?!none\b)\S/mi.test(String(t)) ? 1 : 0), 0)
+      return n ? [`⚠️ the refused state carried ${n} verdict(s) declaring a P0 — they are NOT reproduced here because this state could not be trusted, but they were raised and are not adjudicated.`] : []
+    } catch (e) { return ['⚠️ could not count what the refused state carried — assume it carried findings.'] }
+  })()),
   unresolved_p0: (prior && prior.open_p0s) || [],
   ...(identityOk ? { demoted_p0: priorDemotedSeed } : {}),
   ...(identityOk ? { findings_ledger: priorLedgerSeed } : {}),
@@ -2530,7 +2540,13 @@ if (prevCodexRaw && prior) {
     log(`Round ${priorRound} CONVERGED (both sides). Done.`)
     return {
       ...resultBase, rounds_run: priorRound, converged: true, advisories: gate.advisories, gate_codes: gate.codes,
-      audit_stage: `converged_r${priorRound}`, convergence_status: 'converged',
+      audit_stage: `converged_r${priorRound}`,
+      // 🔴 AUDIT panel-self-triage-0819 — a single-seat run used to emit the SAME
+      // convergence_status as a dual audit, so `converged`/`terminal_state` were
+      // machine-identical and a downstream consumer branching on them drew a stronger
+      // conclusion than one reviewer with no cross-examination can support.  The prose
+      // said "single seat"; nothing that branches reads prose.
+      convergence_status: MODE === 'codex_only' ? 'converged_single_seat' : 'converged',
       demoted_p0: demotedLog,   // findings demoted in earlier rounds: they do not block, but they must reach a human with the terminal
       needs_expert_signoff: false,
       agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed, codex_in_main_loop: priorRound },

@@ -57,6 +57,7 @@ const HANDSHAKE_KEYS = ['prior_state', 'codex_prev_verdict_raw', 'codex_exit_cod
 // mapped to INVALID_AUDIT rather than to anything that could read as approval.
 // ---------------------------------------------------------------------------
 const CONVERGED = 'CONVERGED'
+const CONVERGED_SINGLE_SEAT = 'CONVERGED_SINGLE_SEAT'
 const NOT_CONVERGED = 'NOT_CONVERGED'
 const INFRASTRUCTURE_BLOCKED = 'INFRASTRUCTURE_BLOCKED'
 const INVALID_AUDIT = 'INVALID_AUDIT'
@@ -105,6 +106,11 @@ function terminalStateOf(res) {
   // converging path, so a missing one means this object did not come from that path.
   if (res.converged === true) {
     if (status === 'converged') return CONVERGED
+    // 🔴 A single-seat run converged on ONE reviewer with no cross-examination. Mapping it to
+    // CONVERGED made it machine-identical to a dual audit, so a consumer branching on
+    // terminal_state or converged drew a stronger assurance than the run supports -- the prose
+    // said "single seat" but nothing that branches reads prose.
+    if (status === 'converged_single_seat') return CONVERGED_SINGLE_SEAT
     return INVALID_AUDIT
   }
   if (NOT_CONVERGED_STATUSES.indexOf(status) >= 0) return NOT_CONVERGED
