@@ -1695,6 +1695,39 @@ function qualifyP0s(rawP0s) {
 
 // ---- combined convergence gate: applied in the MAIN LOOP after BOTH sides' verdicts for a round exist ----
 // claudeRound = output of runClaudeRound; codexParsed = parseSentinel(codex main-loop verdict)
+// ── findings ledger: monotonic, records only, gates NOTHING ─────────────────────────────
+// The measured defect it exists for: openP0s is REPLACED by gate.carry every round, and carry holds
+// only the P0s adjudicated in THAT round, so a finding raised earlier that nobody restates vanishes
+// from every later result while the driver still reports convergence. The consumer then receives an
+// approval over a finding that evaporated, and "nobody found anything" is byte-identical to "the
+// finding was dropped". The ledger never removes an entry; it marks it.
+//
+// It deliberately sets no gate. The panel cannot distinguish "refuted on the merits" from "nobody
+// mentioned it again", and a blocker on every non-restated finding would deadlock ordinary runs.
+// Naming the state is what a human needs; deciding it is not something this code can do.
+//
+// Identity is an OPAQUE sequence number assigned on first entry, never derived from the text: a
+// content hash is a fingerprint, not an identity -- it fragments one finding that two seats
+// paraphrase and merges two different findings that share wording. Matching a restatement back to
+// its entry is therefore a HEURISTIC (normalised text equality). On no match a NEW entry is created
+// rather than merged: a duplicate entry is recoverable, an erased finding is not.
+const normFinding = v => String(v == null ? '' : v).toLowerCase().replace(/\s+/g, ' ').replace(/[.;,]+$/, '').trim()
+function buildFindingsLedger(n, priorLedger, carry) {
+  const out = (Array.isArray(priorLedger) ? priorLedger : []).map(e => ({ ...e }))
+  const seenThisRound = new Set()
+  for (const raw of (Array.isArray(carry) ? carry : [])) {
+    const key = normFinding(raw)
+    if (!key) continue
+    const hit = out.find(e => normFinding(e.text) === key)
+    if (hit) { hit.status = 'open'; hit.last_seen_round = n; seenThisRound.add(hit.id); continue }
+    const id = 'F' + (out.length + 1)
+    out.push({ id, text: String(raw), round_raised: n, last_seen_round: n, status: 'open' })
+    seenThisRound.add(id)
+  }
+  for (const e of out) if (!seenThisRound.has(e.id)) e.status = 'not_restated'
+  return out
+}
+
 function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTimingRounds) {
   const claudeAuditors = (claudeRound.auditors || [])
   const valid = []
@@ -1834,13 +1867,18 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
   if (!rolesUsable && (logicSeatP0 + runSeatP0) > 0) {
     advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit (prior_state.claude_roles missing / length disagrees with the verdict array / all empty). The seat attribution of this round's ${logicSeatP0 + runSeatP0} P0(s) is NOT trustworthy - the sequencing check cannot be made this round, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
   }
-  return { advisories, converged, carry, demoted: demotedP0s, p0Count: newP0s.length, unanchored, litConflicts, claimGap, codeGap, blockers, codes: [], runFindingsConditional, timingRounds }
+  // findings: the P0s THEMSELVES. carry is findings PLUS directives written for the next round's
+  // prompt, and those embed round-varying text (a count of approving verdicts, the auditor's own
+  // claim list), so they can never rematch and get marked not_restated while the gate that
+  // produced them is still firing. A directive is not a finding; the ledger takes findings only.
+  return { advisories, converged, carry, findings: newP0s.slice(), demoted: demotedP0s, p0Count: newP0s.length, unanchored, litConflicts, claimGap, codeGap, blockers, codes: [], runFindingsConditional, timingRounds }
 }
 
 // ============================ MAIN: two-phase, one round per invocation ============================
 let resultBase = {
   task: TASK, project: PROJECT || null, kind: KIND, risk: RISK, mode: MODE,
   rounds_allowed: roundsAllowed, codex_mode: CODEX_MODE, task_fingerprint: TASK_FP, run_id: RUN_ID || null,
+  findings_ledger: [],   // replaced once this round's gate has adjudicated the previous round
 }
 
 // ---- fail-closed: refuse a prior_state that does not belong to THIS audit (cross-project guard) ----
@@ -1856,6 +1894,19 @@ let resultBase = {
 // ⚠️ Carried ONLY AFTER IDENTITY IS CONFIRMED. On terminals reached BEFORE the fingerprint / run_id
 // gates, prior may not belong to this audit at all - mixing another audit's demoted residue into this
 const priorDemotedSeed = (prior && Array.isArray(prior.demoted_p0_log)) ? prior.demoted_p0_log.slice() : []
+// The ledger's whole purpose is that a finding is never lost, so its own load path must not be the
+// one place that loses it. Every neighbouring prior_state field is fail-closed; this one degraded
+// OPEN, and an absent or non-array value silently discarded the entire prior ledger, restarted ids
+// at F1, and let the run reach a terminal that positively asserts nothing was ever recorded.
+//   - non-array  = a corrupt state. REFUSED, like every other malformed prior_state field.
+//   - absent     = a state written before this field existed. Legitimate, but it CANNOT be proven
+//                  complete, so the result says so instead of presenting an empty ledger as a fact.
+const priorLedgerRaw = prior ? prior.findings_ledger : undefined
+const priorLedgerMalformed = !!prior && priorLedgerRaw !== undefined && !Array.isArray(priorLedgerRaw)
+const priorLedgerAbsent = !!prior && priorLedgerRaw === undefined
+const priorLedgerSeed = Array.isArray(priorLedgerRaw) ? priorLedgerRaw.slice() : []
+// Once incomplete, always incomplete: a later round cannot restore what an earlier state never carried.
+const ledgerIncomplete = priorLedgerAbsent || (!!prior && prior.ledger_incomplete === true)
 let identityOk = false
 const shapeAbort = (statusName, why, fix) => ({
   ...resultBase, rounds_run: priorRound, converged: false,
@@ -1864,6 +1915,8 @@ const shapeAbort = (statusName, why, fix) => ({
   blockers: [why],
   unresolved_p0: (prior && prior.open_p0s) || [],
   ...(identityOk ? { demoted_p0: priorDemotedSeed } : {}),
+  ...(identityOk ? { findings_ledger: priorLedgerSeed } : {}),
+  ...(identityOk && ledgerIncomplete ? { ledger_incomplete: true } : {}),
   agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
   recommended_next_action: fix,
 })
@@ -1920,6 +1973,9 @@ if (prior) {
 // Identity confirmed (both the fingerprint gate and the run_id gate passed): from here on a terminal
 // can prove prior belongs to THIS audit, so prior.demoted_p0_log may be carried. The position of
 identityOk = true
+if (priorLedgerMalformed) return shapeAbort('prior_state_findings_ledger_malformed',
+  'prior_state.findings_ledger is present but is not an array — the ledger cannot be proven complete, and silently treating it as empty is exactly the erasure this field exists to prevent',
+  'thread the prior_state returned by the previous call verbatim; do not hand-assemble it')
 
 // ---- deep content checks, AFTER identity is established ----
 // Ordering matters: prove the state BELONGS to this audit first, then be picky about its fields. Reversed,
@@ -2028,6 +2084,7 @@ if (prior && priorRoundValid && priorRound >= 2 && !frozenOk) {
 
 // --- STEP A: if a previous round's codex verdict is in, FIRST evaluate that round's convergence ---
 let openP0s = [], shared = null, startRound = 1, allLit = []
+let findingsLedger = []
 // ⚠️ demotedLog must be declared HERE, at the top level, not inside the STEP A branch below: the
 // handoff return lives OUTSIDE that branch, where a block-scoped let is invisible - probed, it fell
 // back to an empty array every round, so the whole "demoted items survive across rounds" chain
@@ -2035,6 +2092,13 @@ let openP0s = [], shared = null, startRound = 1, allLit = []
 // branch). Seeded from the value already accumulated in prior: the codex-unavailable and
 // budget-exhausted terminals occur BEFORE the gate, when this round has produced no new demotions
 let demotedLog = priorDemotedSeed.slice()   // same source as the shapeAbort terminals; do not compute it twice
+// resultBase is spread by every return below this point, and the real ledger is only computed once
+// the gate has adjudicated the previous round — several terminal exits sit ABOVE that. They used to
+// emit the literal empty array declared with resultBase while prior_state held entries, i.e. a
+// positive assertion that nothing was ever recorded, on exactly the paths where the panel is
+// admitting it could not finish. Seed it here, after identity is confirmed.
+resultBase.findings_ledger = priorLedgerSeed
+if (ledgerIncomplete) resultBase.ledger_incomplete = true
 let timingRounds = (prior && Array.isArray(prior.timing_advisory_rounds)) ? prior.timing_advisory_rounds.slice() : []
 let priorConvergenceNote = null
 // ---- false-death handling: codex did NOT produce a trustworthy verdict for prior.round
@@ -2278,6 +2342,17 @@ if (prevCodexRaw && prior) {
     })(),
   }
   const gate = evaluateConvergence(priorRound, priorClaudeRound, codexParsed, codexInvalid, prior.timing_advisory_rounds)
+  findingsLedger = buildFindingsLedger(priorRound, priorLedgerSeed, gate.findings)
+  // A finding that stops being restated does not block, but it must not be silently absent from what
+  // a human reads. Without this the ledger has NO reader anywhere -- not the driver, not the triage
+  // reminder -- while the terminal says "safe to apply". This is the advisory channel the demoted
+  // P0s already use, NOT a gate: the panel cannot tell "refuted on the merits" from "nobody
+  // mentioned it again", and blocking on the difference would stall ordinary runs.
+  for (const e of findingsLedger) {
+    if (e.status !== 'not_restated') continue
+    gate.advisories.push(`[ADVISORY] a P0 first raised in round ${e.round_raised} is NO LONGER restated and was never explicitly resolved: "${String(e.text).slice(0, 160)}" - the panel does not hold convergence for it (it cannot tell a refutation from a silence); a human must decide which it was.`)
+  }
+  resultBase.findings_ledger = findingsLedger   // resultBase is spread by every return below this point
   timingRounds = gate.timingRounds || timingRounds
   allLit = allLit.concat(prior.lit_conflicts || [], gate.litConflicts || [])
   // Demoted items accumulate across rounds. The cap of 200 exists purely to stop state bloat; when it
@@ -2605,6 +2680,11 @@ return {
     timing_advisory_rounds: timingRounds,
     lit_conflicts: allLit,
     open_p0s: openP0s,                              // surfaced if codex goes unavailable (false-death escalate path)
+    findings_ledger: findingsLedger,                // monotonic: an entry is marked, never removed
+    // Threaded like demoted_p0_log and timing_advisory_rounds, and for the same reason: written
+    // only onto this round's result it survives exactly ONE invocation, and the next round then
+    // presents a ledger it cannot prove complete as complete.
+    ...(ledgerIncomplete ? { ledger_incomplete: true } : {}),
     last_codex_brief: codexBrief,                   // false-death retry: re-run codex on THIS exact brief, no Claude re-run
     last_codex_brief_tag: tag,
     codex_unavailable_streak: 0,                     // reset: codex DID produce output to reach this round
