@@ -70,6 +70,7 @@ const INVALID_STATUSES = [
   'prior_state_run_id_mismatch', 'prior_state_budget_invalid',
   'prior_state_legacy_worker_format', 'prior_state_schema_invalid',
   'prior_state_frozen_r1_missing',
+  'prior_state_findings_ledger_malformed',
 ]
 // The panel ran to the end of its round budget with substantive disagreement, or the
 // reviewers agreed but could not anchor a claim and asked for human sign-off.

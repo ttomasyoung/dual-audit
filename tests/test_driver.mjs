@@ -171,6 +171,24 @@ await t('A11 pending but no prior_state -> INFRASTRUCTURE_BLOCKED',
   (m) => runDriver({ panelReplies: [{ audit_stage: 'r1_pending_codex', codex_brief: 'b' }], agentReply: block(0), mutate: m }),
   (r) => r.terminal_state === 'INFRASTRUCTURE_BLOCKED')
 
+// A refusal of a corrupt handshake adjudicated NOTHING. Every sibling prior_state_* abort is in
+// INVALID_STATUSES; a new one that is not gets classified as a substantive non-convergence, and the
+// consumer is then handed unresolved_p0 inherited verbatim from the state that was just refused.
+// Adding a terminal status without enumerating its readers is how that happens.
+await t('A11c a refused malformed prior ledger classifies as INVALID_AUDIT, like every sibling refusal',
+  (m) => runDriver({ panelReplies: [{ converged: false, audit_stage: 'escalate_to_user',
+    convergence_status: 'prior_state_findings_ledger_malformed' }], mutate: m }),
+  (r) => r.terminal_state === 'INVALID_AUDIT' && r.converged === false)
+
+// The findings ledger is monotonic INSIDE the panel, but the driver is what the caller actually
+// reads: it rewrites the terminal object before handing it back. A field the panel keeps and the
+// driver drops is indistinguishable, at the boundary, from a panel that never recorded it.
+await t('A11b the findings ledger survives the driver boundary',
+  (m) => runDriver({ panelReplies: [{ converged: true, convergence_status: 'converged',
+    findings_ledger: [{ id: 'F1', text: 'zed.py:71 the retry loop never exits', round_raised: 1, status: 'not_restated' }] }], mutate: m }),
+  (r) => Array.isArray(r.findings_ledger) && r.findings_ledger.length === 1
+      && r.findings_ledger[0].id === 'F1' && r.findings_ledger[0].status === 'not_restated')
+
 await t('A12 panel never terminal -> call cap -> INFRASTRUCTURE_BLOCKED, panel content preserved',
   (m) => runDriver({ panelReplies: [{ ...PENDING, blockers: ['open issue from the last round'] }], agentReply: block(0), mutate: m }),
   (r) => r.terminal_state === 'INFRASTRUCTURE_BLOCKED' && r.panel_calls === 8 &&

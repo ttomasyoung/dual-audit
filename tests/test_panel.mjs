@@ -58,6 +58,11 @@ const CLAUDE_TALKS_ABOUT = 'VERDICT: REJECT\nP0: the delete path removes user da
 // side's P0s this reviewer overturned. Naming P0 there is what DELTA is FOR. 8 of the 13 refusals.
 const CLAUDE_DELTA_NAMES_P0 = 'VERDICT: APPROVE\nP0: none\nDELTA: I overturned the other side P0: (1) instrumented the call, the guard uses the same path at line 378\nEVIDENCE: read 3 files line 12\nVERIFIED: pass\nEND'
 const CLAUDE_CLEAN_R = 'VERDICT: REJECT\nP0: none\nEVIDENCE: reviewed line 5 structure ok\nVERIFIED: pass\nEND'  // clean fixture: only the consensus gate can block it
+// RETENTION fixture: five distinct, individually locatable P0s raised in one round-1 verdict.
+const RET_IDS = ['bar.py:11', 'bar.py:12', 'bar.py:13', 'bar.py:14', 'bar.py:15']
+const CLAUDE_FIVE_P0 = 'VERDICT: REJECT\nP0: bar.py:11 the retry loop never exits; bar.py:12 the lock is released twice; '
+  + 'bar.py:13 the digest covers the wrong buffer; bar.py:14 the fallback swallows the error code; '
+  + 'bar.py:15 the cache key omits the version\nEVIDENCE: read 5 files line 7\nVERIFIED: fail\nEND'
 const cxApprove      = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: static/import ok, 3 modules\nVERIFIED: pass\nAUDIT-ID: ${id}\nEND`
 const cxApproveDelta = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: re-ran, fix line 90\nVERIFIED: pass\nDELTA: re-verified line 90 now passes\nAUDIT-ID: ${id}\nEND`
 const cxCleanReject  = id => `VERDICT: REJECT\nP0: none\nEVIDENCE: reviewed 3 files structure ok\nVERIFIED: pass\nAUDIT-ID: ${id}\nEND`
@@ -154,7 +159,21 @@ const R1bio = (await runPanel(B_BIO, async () => CLAIM_A)).r
 const R1bioUn = (await runPanel(B_BIO, async () => CLAIM_UN)).r
 
 const conv = (r) => r && r.converged === true && r.convergence_status === 'converged' && r.audit_stage === 'converged_r1' && (r.blockers || []).length === 0 && r.needs_expert_signoff === false
+const RET_R1 = (await runPanel(BSRC, async () => CLAUDE_FIVE_P0)).r
 const CASES_B = [
+  // RETENTION: every P0 raised in round 1 must reach the next round's OPEN P0 LEDGER.
+  // WITHOUT this case, replacing `const carry = newP0s.slice()` with
+  // `const carry = []` -- a mutation that erases every open finding -- still left this suite
+  // at 111 passed / 0 failed. A suite that cannot see findings disappear cannot serve as
+  // acceptance evidence for anything about finding retention.
+  { n: 'RETENTION every R1 P0 reaches the next round ledger',
+    args: { ...BSRC, prior_state: RET_R1.prior_state, codex_prev_verdict_raw: cxApprove(RET_R1.task_fingerprint + '_r1'), codex_exit_code: 0 },
+    fn: () => CLAUDE_APPROVE,
+    ok: r => { const m = /OPEN P0 LEDGER[^\n]*/.exec(r.codex_brief || '')
+               return !!m && RET_IDS.every(id => m[0].includes(id)) },
+    g: 'const converged = blockers.length === 0\n  const carry = newP0s.slice()',
+    gf: 'const converged = blockers.length === 0\n  const carry = []' },
+
   { n: 'B0 converges on a clean round',         args: R2ok,                                                        fn: () => CLAUDE_APPROVE, ok: conv },
   { n: 'B1 reviewer verdict with the wrong audit id',        args: { ...R2ok, codex_prev_verdict_raw: cxApprove(FP + '_r9') },   fn: () => CLAUDE_APPROVE, ok: r => r.converged === false && r.convergence_status === 'codex_verdict_identity_mismatch', g: 'if (!idOk) {', gf: 'if (false) {' },
   // The reviewer CLI prints its verdict twice and the wrapper marks both copies, so they arrive
@@ -466,5 +485,98 @@ console.log('\n[note] the round-overflow backstop is provably unreachable: the r
 console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assertion. A crash counts as a FAILURE,
        not a kill: it is weak evidence that the guard was doing the work, so such a mutant must be replaced
        by one that does not crash. This should be 0.`)
+
+// ============ Group L: the findings ledger is monotonic ============
+// The defect it exists for: openP0s is REPLACED by gate.carry each round and carry holds only the
+// P0s adjudicated in THAT round, so a finding raised earlier that nobody restates disappears from
+// every later result while the run still reports convergence -- the caller is handed an approval
+// over a finding that evaporated, and "nobody found anything" becomes byte-identical to "the
+// finding was dropped".
+// Observation point: the panel runs ONE round per invocation and a round's P0s are adjudicated by
+// the NEXT invocation, so a non-restatement is only visible at the third call. Asserting earlier
+// measures something else.
+{
+  console.log('\n=== Group L: findings ledger ===')
+  const LDEEP = { ...BSRC, mode: 'deep' }
+  const L_A = 'VERDICT: REJECT\nP0: zed.py:71 the retry loop never exits; zed.py:72 the lock is released twice\nEVIDENCE: read 4 files line 9\nVERIFIED: fail\nEND'
+  const L_B = 'VERDICT: REJECT\nP0: zed.py:71 the retry loop never exits\nEVIDENCE: re-read line 9 again\nVERIFIED: fail\nEND'
+  const step = async (prev, fn) => (await runPanel({ ...LDEEP, prior_state: prev.prior_state, codex_prev_verdict_raw: cxCleanReject(prev.task_fingerprint + '_r' + prev.prior_state.round), codex_exit_code: 0 }, fn)).r
+  const l1 = (await runPanel(LDEEP, async () => L_A)).r
+  const l2 = await step(l1, async () => L_B)
+  const l3 = await step(l2, async () => L_B)
+
+  rec(Array.isArray(l1.findings_ledger) && Array.isArray(l2.findings_ledger), 'L1 every result carries a findings_ledger array', `r1=${typeof l1.findings_ledger} r2=${typeof l2.findings_ledger}`)
+  const led2 = l2.findings_ledger || [], ids2 = led2.map(e => e.id)
+  rec(led2.length >= 2 && new Set(ids2).size === ids2.length, 'L2 both round-1 findings get a distinct id (ledger must be non-empty)', `ids=${JSON.stringify(ids2)}`)
+  rec(led2.length >= 2 && led2.every(e => e.status === 'open'), 'L3 freshly adjudicated entries are open (every() is vacuously true on [], so length is asserted too)', JSON.stringify(led2))
+  rec(led2.length >= 2 && led2.every(e => e.round_raised === 1), 'L4 an entry remembers which round raised it', JSON.stringify(led2.map(e => e.round_raised)))
+
+  const led3 = l3.findings_ledger || []
+  const e71 = led3.find(e => /zed\.py:71/.test(e.text || ''))
+  const e72 = led3.find(e => /zed\.py:72/.test(e.text || ''))
+  rec(!!e72, 'L5 the finding nobody restated is STILL in the ledger -- disappearance is the violation', `n=${led3.length}`)
+  rec(!!e72 && e72.status === 'not_restated', 'L6 it is marked not_restated, not silently green and not gone', `status=${e72 && e72.status}`)
+  rec(!!e71 && e71.status === 'open', 'L7 the restated one stays open', `status=${e71 && e71.status}`)
+  const idOf = (led, re) => { const e = led.find(x => re.test(x.text || '')); return e && e.id }
+  rec(!!idOf(led2, /zed\.py:71/) && idOf(led2, /zed\.py:71/) === idOf(led3, /zed\.py:71/), 'L8 a restatement keeps its id and does not create a second entry', `r2=${idOf(led2, /zed\.py:71/)} r3=${idOf(led3, /zed\.py:71/)}`)
+  const ids3 = led3.map(e => e.id)
+  rec(ids3.length >= 2 && new Set(ids3).size === ids3.length, 'L9 no duplicate entries (must actually have entries)', `ids=${JSON.stringify(ids3)}`)
+}
+
+// ---- L10-L13: holes the panel found in its own ledger, each fixed and pinned ----
+{
+  const LD2 = { ...BSRC, mode: 'deep' }
+  const P_A = 'VERDICT: REJECT\nP0: hex.py:31 the writer truncates before reading\nEVIDENCE: read 4 files line 9\nVERIFIED: fail\nEND'
+  const q1 = (await runPanel(LD2, async () => P_A)).r
+  const q2 = (await runPanel({ ...LD2, prior_state: q1.prior_state, codex_prev_verdict_raw: cxCleanReject(q1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => P_A)).r
+  const inLedger = (r, re) => (r.findings_ledger || []).some(e => re.test(e.text || ''))
+  rec(inLedger(q2, /hex\.py:31/), 'L10-pre the finding is in the ledger at this point (premise of what follows)', `n=${(q2.findings_ledger || []).length}`)
+
+  const qUnavail = (await runPanel({ ...LD2, prior_state: q2.prior_state, codex_prev_verdict_raw: cxCleanReject(q2.task_fingerprint + '_r2'), codex_exit_code: 1 }, async () => P_A)).r
+  rec(inLedger(qUnavail, /hex\.py:31/), 'L10 a terminal reached BEFORE the gate does not empty the ledger', `status=${qUnavail.convergence_status} n=${(qUnavail.findings_ledger || []).length}`)
+
+  const qBad = (await runPanel({ ...LD2, prior_state: { ...q2.prior_state, findings_ledger: 'not-an-array' }, codex_prev_verdict_raw: cxCleanReject(q2.task_fingerprint + '_r2'), codex_exit_code: 0 }, async () => P_A)).r
+  rec(qBad.converged === false && /ledger/i.test(String(qBad.convergence_status) + JSON.stringify(qBad.blockers || [])),
+      'L11 a non-array prior ledger is REFUSED, not silently discarded', `status=${qBad.convergence_status}`)
+
+  const { findings_ledger: _drop, ...psNoLedger } = q2.prior_state
+  const qMissing = (await runPanel({ ...LD2, prior_state: psNoLedger, codex_prev_verdict_raw: cxCleanReject(q2.task_fingerprint + '_r2'), codex_exit_code: 0 }, async () => P_A)).r
+  rec(qMissing.ledger_incomplete === true, 'L12 an absent prior ledger is marked incomplete, not presented as empty-and-complete', `ledger_incomplete=${qMissing.ledger_incomplete}`)
+
+  // The fixture must actually PRODUCE the directive, or the next assertion passes on nothing.
+  const NODIGIT = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: looks structurally fine\nVERIFIED: pass\nEND'
+  const d1 = (await runPanel(LD2, async () => NODIGIT)).r
+  const d2 = (await runPanel({ ...LD2, prior_state: d1.prior_state, codex_prev_verdict_raw: cxCleanReject(d1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => NODIGIT)).r
+  const DIRECTIVE = /must cite a CONCRETE locator|Anchor these to a decisive/
+  const fired = DIRECTIVE.test(JSON.stringify((d2.prior_state && d2.prior_state.open_p0s) || []))
+  rec(fired, 'L13-pre the directive really was produced this round (otherwise L13 passes on nothing)', `fired=${fired}`)
+  rec(fired && !(d2.findings_ledger || []).some(e => DIRECTIVE.test(e.text || '')), 'L13 a next-round directive is not a finding and does not enter the ledger', 'directive present as finding')
+}
+
+// ---- L14/L16: repair B was only half closed; the delta round found the rest ----
+{
+  const LD3 = { ...BSRC, mode: 'deep' }
+  const P_B = 'VERDICT: REJECT\nP0: oct.py:52 the digest covers the wrong buffer\nEVIDENCE: read 4 files line 9\nVERIFIED: fail\nEND'
+  const w1 = (await runPanel(LD3, async () => P_B)).r
+  const w2 = (await runPanel({ ...LD3, prior_state: w1.prior_state, codex_prev_verdict_raw: cxCleanReject(w1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => P_B)).r
+  const { findings_ledger: _d2, ...wLegacy } = w2.prior_state
+  const w3 = (await runPanel({ ...LD3, prior_state: wLegacy, codex_prev_verdict_raw: cxCleanReject(w2.task_fingerprint + '_r2'), codex_exit_code: 0 }, async () => P_B)).r
+  rec(w3.ledger_incomplete === true, 'L14-pre resuming from a pre-field state really did mark it incomplete', `v=${w3.ledger_incomplete}`)
+  rec(!!(w3.prior_state && w3.prior_state.ledger_incomplete === true),
+      'L14 the incomplete marker is threaded into prior_state, or it survives exactly one invocation', `in_prior=${w3.prior_state && w3.prior_state.ledger_incomplete}`)
+
+  // A not_restated entry must reach the channel demoted P0s already use, or the ledger has no reader.
+  // Assert on a TERMINAL: that is what the driver hands back; a handoff routes advisories elsewhere.
+  const A2_ = 'VERDICT: REJECT\nP0: oct.py:52 the digest covers the wrong buffer; oct.py:53 the fallback swallows the code\nEVIDENCE: read 4 files line 9\nVERIFIED: fail\nEND'
+  const v1 = (await runPanel(LD3, async () => A2_)).r
+  const v2 = (await runPanel({ ...LD3, prior_state: v1.prior_state, codex_prev_verdict_raw: cxCleanReject(v1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => P_B)).r
+  const v3 = (await runPanel({ ...LD3, prior_state: v2.prior_state, codex_prev_verdict_raw: cxCleanReject(v2.task_fingerprint + '_r2'), codex_exit_code: 0 }, async () => P_B)).r
+  const v4 = (await runPanel({ ...LD3, prior_state: v3.prior_state, codex_prev_verdict_raw: cxCleanReject(v3.task_fingerprint + '_r3'), codex_exit_code: 0 }, async () => P_B)).r
+  const nr = (v4.findings_ledger || []).filter(e => e.status === 'not_restated')
+  rec(nr.length >= 1, 'L16-pre the terminal really has a not_restated entry (else L16 passes on nothing)', `n=${nr.length}`)
+  rec(nr.length >= 1 && (v4.advisories || []).some(a => /NO LONGER restated/.test(String(a)) && /oct\.py:53/.test(String(a))),
+      'L16 a not_restated finding is NAMED in the terminal advisories, or nothing reads the ledger', `advisories=${(v4.advisories || []).length}`)
+}
+
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
 if (fail) process.exit(1)
