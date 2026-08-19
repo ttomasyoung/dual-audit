@@ -1712,7 +1712,10 @@ function qualifyP0s(rawP0s) {
 // its entry is therefore a HEURISTIC (normalised text equality). On no match a NEW entry is created
 // rather than merged: a duplicate entry is recoverable, an erased finding is not.
 const normFinding = v => String(v == null ? '' : v).toLowerCase().replace(/\s+/g, ' ').replace(/[.;,]+$/, '').trim()
-function buildFindingsLedger(n, priorLedger, carry) {
+// markAbsent: true on an ADJUDICATION round (the previous round's verdicts are being judged, so a
+// finding nobody restated genuinely stopped being restated).  false when merely RECORDING what a
+// round raised -- there, absence from this one list means nothing and marking it would be a lie.
+function buildFindingsLedger(n, priorLedger, carry, markAbsent = true) {
   const out = (Array.isArray(priorLedger) ? priorLedger : []).map(e => ({ ...e }))
   const seenThisRound = new Set()
   for (const raw of (Array.isArray(carry) ? carry : [])) {
@@ -1724,7 +1727,7 @@ function buildFindingsLedger(n, priorLedger, carry) {
     out.push({ id, text: String(raw), round_raised: n, last_seen_round: n, status: 'open' })
     seenThisRound.add(id)
   }
-  for (const e of out) if (!seenThisRound.has(e.id)) e.status = 'not_restated'
+  if (markAbsent) for (const e of out) if (!seenThisRound.has(e.id)) e.status = 'not_restated'
   return out
 }
 
@@ -1827,6 +1830,19 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
     const codexPass = valid.some(a => a.kind === 'codex' && a.parsed.verified === 'pass')
     const claudePass = valid.some(a => a.kind === 'claude' && a.parsed.verified === 'pass')
     if (anyFail) codeGap = 'code dry-run/smoke-test FAILED (VERIFIED:fail)'
+    // 🔴 In `codex_only` there are no Claude seats by construction (runClaudeRound dispatches an
+    // empty spec list), so demanding a passing Claude verdict is a condition nothing can satisfy:
+    // measured, codex_only+code and codex_only+mixed could NEVER converge and emitted that
+    // impossibility as their sole blocker, which reads like a finding about the code under review.
+    // A gate that cannot be satisfied is not a gate, it is a deadlock with a misleading label.
+    // Single-seat mode converges on the static reading alone — and says so, loudly, rather than
+    // letting the absence of a run seat pass unmentioned.
+    else if (MODE === 'codex_only') {
+      if (!codexPass) codeGap = 'code not verified by codex (static/contract)'
+      else advisories.push('[ADVISORY] SINGLE SEAT: this run had NO Claude run seat, so nothing was executed — '
+        + 'the code was read statically and never run. "VERIFIED: pass" here means the static/contract reading passed, '
+        + 'NOT that a dry-run or smoke-test succeeded.')
+    }
     else if (!(codexPass && claudePass)) codeGap = 'code not independently verified by BOTH Codex(static/contract) and Claude(run)'
     if (codeGap) blockers.push(codeGap)
   }
@@ -2343,6 +2359,7 @@ if (prevCodexRaw && prior) {
   }
   const gate = evaluateConvergence(priorRound, priorClaudeRound, codexParsed, codexInvalid, prior.timing_advisory_rounds)
   findingsLedger = buildFindingsLedger(priorRound, priorLedgerSeed, gate.findings)
+
   // A finding that stops being restated does not block, but it must not be silently absent from what
   // a human reads. Without this the ledger has NO reader anywhere -- not the driver, not the triage
   // reminder -- while the terminal says "safe to apply". This is the advisory channel the demoted
@@ -2518,7 +2535,14 @@ if (prevCodexRaw && prior) {
       needs_expert_signoff: false,
       agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed, codex_in_main_loop: priorRound },
       literature_conflicts: allLit,
-      recommended_next_action: 'CONVERGED: both Claude and Codex sides cleared this round with zero P0 (claims anchored AND code dual-verified where applicable). Safe to pass to the next chain link / apply.',
+      // 🔴 AUDIT panel-self-0818 (P0 #4/#6/#10) — this sentence used to be emitted verbatim for
+      // `codex_only` too, a mode that dispatches ZERO Claude seats by design.  The reader was told
+      // "both sides cleared" about a round only one side ever saw, and "safe to apply" about code
+      // nobody ran.  The mode is deliberate (single-seat review of a simple question); the sentence
+      // was not.  What a single seat bought must be stated as what a single seat bought.
+      recommended_next_action: MODE === 'codex_only'
+        ? 'CONVERGED (SINGLE SEAT): codex reviewed this alone — zero Claude seats were dispatched, so there was no run seat and NO independent second reading. This is one reviewer with no cross-examination; treat it as such, not as a dual audit.'
+        : 'CONVERGED: both Claude and Codex sides cleared this round with zero P0 (claims anchored AND code dual-verified where applicable). Safe to pass to the next chain link / apply.',
     }
   }
   // not converged this round -> escalate to next round if budget/rounds allow
@@ -2629,6 +2653,17 @@ if (n === 1 && !hasIndependentR1Source) {
 }
 phase(n === 1 ? 'Round 1 (independent)' : `Round ${n} (cross-examine)`)
 const claudeRound = await runClaudeRound(n, openP0s, shared)
+// 🔴 AUDIT panel-self-0818 (P0 #3/#5/#8) — a finding raised THIS round lived only in
+// prior_state.claude_verdicts_raw until the NEXT invocation adjudicated it.  Every terminal
+// reached before that (codex unavailable, retry, ceiling) therefore reported unresolved_p0
+// from the incoming carry, which at round 1 is empty, and the finding's text was absent from
+// every reader-visible field.  Measured: a Claude seat returning a fully-formed blocking
+// finding ended as codex_unavailable with the text present ONLY inside prior_state.
+// The ledger records what was RAISED; it does not wait for adjudication.  markAbsent=false
+// because absence from one round's own verdict list says nothing about earlier entries.
+findingsLedger = buildFindingsLedger(n, findingsLedger.length ? findingsLedger : priorLedgerSeed,
+  (claudeRound.auditors || []).flatMap(a => (a.parsed && a.parsed.p0) || []), false)
+resultBase.findings_ledger = findingsLedger
 const codexBrief = (n === 1)
   ? rawSourceBrief()
   : sharedCodexBrief(n, shared, openP0s)
