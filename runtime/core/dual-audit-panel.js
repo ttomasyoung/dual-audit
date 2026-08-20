@@ -1711,19 +1711,46 @@ function qualifyP0s(rawP0s) {
 // paraphrase and merges two different findings that share wording. Matching a restatement back to
 // its entry is therefore a HEURISTIC (normalised text equality). On no match a NEW entry is created
 // rather than merged: a duplicate entry is recoverable, an erased finding is not.
-const normFinding = v => String(v == null ? '' : v).toLowerCase().replace(/\s+/g, ' ').replace(/[.;,]+$/, '').trim()
+// NOT lowercased. Findings are file:line locators and this is a case-sensitive filesystem, so
+// `src/Foo.js:10 ...` and `src/foo.js:10 ...` are findings about two DIFFERENT files -- and
+// case-folding collapsed them into one entry, silently dropping the second. That is precisely the
+// erasure this ledger was built to prevent, reintroduced by its own matcher. Keeping case makes the
+// matcher stricter, so the failure moves to SPLIT (a duplicate entry, recoverable) instead of MERGE
+// (a finding gone, not recoverable) -- the direction this file already chose everywhere else.
+const normFinding = v => String(v == null ? '' : v).replace(/\s+/g, ' ').replace(/[.;,]+$/, '').trim()
 // markAbsent: true on an ADJUDICATION round (the previous round's verdicts are being judged, so a
 // finding nobody restated genuinely stopped being restated).  false when merely RECORDING what a
 // round raised -- there, absence from this one list means nothing and marking it would be a lie.
 function buildFindingsLedger(n, priorLedger, carry, markAbsent = true) {
   const out = (Array.isArray(priorLedger) ? priorLedger : []).map(e => ({ ...e }))
+  // seenThisRound is keyed by id, so two entries sharing one id make restating EITHER mark the
+  // other seen -- shielding a genuinely un-restated finding from being marked, and reporting it
+  // to the reader as still open. The array shape is validated on load; the entries inside it are
+  // not, so a duplicate or missing id can arrive from a hand-assembled state. Repair it here
+  // rather than trusting it: a reassigned id is a cosmetic loss, a shielded finding is not.
+  {
+    const used = new Set()
+    let max = 0
+    for (const e of out) { const m = /^F(\d+)$/.exec(String(e && e.id)); if (m && +m[1] > max) max = +m[1] }
+    for (const e of out) {
+      const id = String((e && e.id) == null ? '' : e.id)
+      if (!id || used.has(id)) { e.id = 'F' + (++max) }
+      used.add(String(e.id))
+    }
+  }
   const seenThisRound = new Set()
   for (const raw of (Array.isArray(carry) ? carry : [])) {
     const key = normFinding(raw)
     if (!key) continue
     const hit = out.find(e => normFinding(e.text) === key)
     if (hit) { hit.status = 'open'; hit.last_seen_round = n; seenThisRound.add(hit.id); continue }
-    const id = 'F' + (out.length + 1)
+    // NOT `'F' + (out.length + 1)`: that assumes the ids present are dense 1..n. The panel
+    // refuses a non-array findings_ledger but does not validate the entries inside one, so a
+    // prior_state carrying [F3, F2] made the next entry F3 as well -- two distinct findings
+    // sharing one id, in the one structure whose entire purpose is stable identity.
+    let max = 0
+    for (const e of out) { const m = /^F(\d+)$/.exec(String(e && e.id)); if (m && +m[1] > max) max = +m[1] }
+    const id = 'F' + (max + 1)
     out.push({ id, text: String(raw), round_raised: n, last_seen_round: n, status: 'open' })
     seenThisRound.add(id)
   }
@@ -1891,7 +1918,12 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
   // timing_advisory_rounds, so carrying it as well makes it appear TWICE -- and E-carry asserts
   // exactly one, which is how the previous attempt at this repair broke it. Everything else here
   // is a one-off reading of the verdict being adjudicated: not carried, it dies with its round.
-  const advisoriesOneOff = advisories.filter(a => !/^\[ADVISORY\] SEQUENCING/.test(String(a)))
+  // SEQUENCING is not the only advisory recomputed every round. The seat-identity one is too,
+  // and it embeds `${logicSeatP0 + runSeatP0}` -- so the carried copy never string-equals the
+  // regenerated one, exact-string dedup misses it, and a terminal ended up with several lines
+  // all reading "this round's N P0(s)" for different N, none saying which round it meant.
+  const REGENERATED_EVERY_ROUND = /^\[ADVISORY\] (SEQUENCING|Seat identity was lost)/
+  const advisoriesOneOff = advisories.filter(a => !REGENERATED_EVERY_ROUND.test(String(a)))
   return { advisories, advisoriesOneOff, converged, carry, findings: newP0s.slice(), demoted: demotedP0s, p0Count: newP0s.length, unanchored, litConflicts, claimGap, codeGap, blockers, codes: [], runFindingsConditional, timingRounds }
 }
 
@@ -1941,15 +1973,29 @@ const shapeAbort = (statusName, why, fix) => ({
   // trusting their content: a count is not an adjudication.
   blockers: [why].concat((() => {
     try {
-      const raw = (prior && prior.claude_verdicts_raw) || []
-      const n = (Array.isArray(raw) ? raw : []).reduce((k, t) => k + (/^P0:\s*(?!none\b)\S/mi.test(String(t)) ? 1 : 0), 0)
-      return n ? [`⚠️ the refused state carried ${n} verdict(s) declaring a P0 — they are NOT reproduced here because this state could not be trusted, but they were raised and are not adjudicated.`] : []
-    } catch (e) { return ['⚠️ could not count what the refused state carried — assume it carried findings.'] }
+      const raw = (prior && Array.isArray(prior.claude_verdicts_raw)) ? prior.claude_verdicts_raw : []
+      const all = raw.concat(prevCodexRaw ? [prevCodexRaw] : [])
+      if (!all.length) return []
+      // Count VERDICTS, which needs no parsing and therefore cannot be wrong. The previous
+      // version counted P0-DECLARING verdicts with /^P0:/, which misses `**P0**:`, a full-width
+      // colon, and an indent -- shapes test_panel.mjs:48-55 catalogues precisely because naming
+      // them one at a time is how four earlier fixes in this file went wrong. It also read 0 in
+      // codex_only by construction, where claude_verdicts_raw is empty. So: an exact count is a
+      // claim this code cannot support; a floor that says it is a floor is one it can.
+      // Same prefix tolerance as BULLET_FIELD at :858 -- indent, bullet, digit, space before the
+      // colon -- because those are exactly the shapes the panel's own parser RECORDS as real
+      // blocking findings. A counter stricter than the parser reports "nothing declared" about a
+      // verdict the parser already read as a blocker.
+      const atLeast = all.reduce((k, t) => k + (/^\s*[-*\u2022>\d.)\]]*\s*P0\s*[:：]\s*(?!none\b)\S/mi.test(String(t)) ? 1 : 0), 0)
+      return [`⚠️ the refused state carried ${all.length} verdict(s), NOT adjudicated and NOT reproduced here (this state could not be trusted). At least ${atLeast} of them declare a P0 — that is a FLOOR, not a count: a blocker written with another prefix shape is not matched. Read them yourself.`]
+    } catch (e) { return ['⚠️ could not read what the refused state carried — assume it carried findings.'] }
   })()),
   unresolved_p0: (prior && prior.open_p0s) || [],
   ...(identityOk ? { demoted_p0: priorDemotedSeed } : {}),
   ...(identityOk ? { findings_ledger: priorLedgerSeed } : {}),
-  ...(identityOk && ledgerIncomplete ? { ledger_incomplete: true } : {}),
+  // Also on the MALFORMED refusal: that terminal is precisely where the ledger cannot be
+  // proven complete, and it was the one refusal that did not say so.
+  ...(identityOk && (ledgerIncomplete || priorLedgerMalformed) ? { ledger_incomplete: true } : {}),
   agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
   recommended_next_action: fix,
 })
@@ -2130,7 +2176,14 @@ let demotedLog = priorDemotedSeed.slice()   // same source as the shapeAbort ter
 // emit the literal empty array declared with resultBase while prior_state held entries, i.e. a
 // positive assertion that nothing was ever recorded, on exactly the paths where the panel is
 // admitting it could not finish. Seed it here, after identity is confirmed.
-resultBase.findings_ledger = priorLedgerSeed
+// Copied, not aliased: measured, result.findings_ledger === prior_state.findings_ledger was
+// true, so the returned object and the state it came from were one array. Nothing mutates it
+// today, which is the kind of "safe for now" that stops being true without anything failing.
+resultBase.findings_ledger = priorLedgerSeed.map(e => (e && typeof e === 'object') ? { ...e } : e)
+// Same reasoning for the carried advisories, one level up: a return that gives up reaches the
+// reader through `...resultBase` and nothing else, so seeding it here covers every such exit at
+// once. A path that computes real advisories overrides this by setting the key after the spread.
+resultBase.advisories = advisoryCarry.slice()
 if (ledgerIncomplete) resultBase.ledger_incomplete = true
 let timingRounds = (prior && Array.isArray(prior.timing_advisory_rounds)) ? prior.timing_advisory_rounds.slice() : []
 let priorConvergenceNote = null
@@ -2153,6 +2206,12 @@ if (codexUnavailable) {
     return {
       ...resultBase, rounds_run: priorRound, converged: false,
       audit_stage: 'escalate_to_user', convergence_status: 'codex_unavailable',
+      // Carried advisories must survive HERE too. This terminal is reached without running the
+      // gate, so the merge that happens inside it never runs, and the driver only ever reads the
+      // LAST result: an advisory raised in round 1 and carried into round 2 vanished completely
+      // if round 2's codex then failed twice. The path that gives up is the path a reader most
+      // needs the earlier warnings on.
+      advisories: advisoryCarry.slice(),
       demoted_p0: demotedLog,
       needs_expert_signoff: false,
       blockers: [`codex produced no trustworthy verdict ${streak}x (${why}) for round ${priorRound} — cannot complete the independent dual-audit; do NOT treat the absence/kill as a pass. Surface to the user (codex may be down: timeout too tight / auth / sqlite lock / network).`],
@@ -2385,9 +2444,21 @@ if (prevCodexRaw && prior) {
   const ADVISORY_CARRY_CAP = 200
   for (const a of (gate.advisoriesOneOff || [])) if (!advisoryCarry.includes(a)) advisoryCarry.push(a)
   if (advisoryCarry.length > ADVISORY_CARRY_CAP) {
-    const dropped = advisoryCarry.length - ADVISORY_CARRY_CAP
-    advisoryCarry = advisoryCarry.slice(-ADVISORY_CARRY_CAP)
-    advisoryCarry.unshift(`[ADVISORY] ${dropped} earlier advisory line(s) dropped at the ${ADVISORY_CARRY_CAP} cap — said out loud so the truncation is never silent.`)
+    // Two bugs, one shape -- the notice is itself an entry and was not accounted for.
+    //   slice(CAP) then unshift produced CAP+1, so the stated cap was never the real one.
+    //   The next truncation sliced the previous notice away, resetting the tally to only what
+    //   THIS pass dropped -- so a long run under-reported its own losses, which is the silent
+    //   truncation the notice exists to prevent.
+    let prevDropped = 0
+    advisoryCarry = advisoryCarry.filter(a => {
+      const m = /^\[ADVISORY\] (\d+) earlier advisory line\(s\) dropped/.exec(String(a))
+      if (m) { prevDropped += Number(m[1]) || 0; return false }
+      return true
+    })
+    const keep = ADVISORY_CARRY_CAP - 1          // the notice occupies one slot: CAP means CAP
+    const dropped = prevDropped + Math.max(0, advisoryCarry.length - keep)
+    advisoryCarry = advisoryCarry.slice(-keep)
+    advisoryCarry.unshift(`[ADVISORY] ${dropped} earlier advisory line(s) dropped at the ${ADVISORY_CARRY_CAP} cap — cumulative across truncations, said out loud so it is never silent.`)
   }
   gate.advisories = gate.advisories.concat(advisoryCarry.filter(a => !gate.advisories.includes(a)))
 
@@ -2398,9 +2469,16 @@ if (prevCodexRaw && prior) {
   // mentioned it again", and blocking on the difference would stall ordinary runs.
   for (const e of findingsLedger) {
     if (e.status !== 'not_restated') continue
-    gate.advisories.push(`[ADVISORY] a P0 first raised in round ${e.round_raised} is NO LONGER restated and was never explicitly resolved: "${String(e.text).slice(0, 160)}" - the panel does not hold convergence for it (it cannot tell a refutation from a silence); a human must decide which it was.`)
+    // Says what the matcher can actually establish. Measured: rewording "at line 44" to "on
+    // line 44" produced BOTH a duplicate entry AND this line asserting the finding was "NO
+    // LONGER restated" -- while it was restated immediately below, in different words. The
+    // matcher compares normalised text, so a paraphrase and a silence are the same event to it.
+    gate.advisories.push(`[ADVISORY] a P0 first raised in round ${e.round_raised} was not restated IN MATCHING WORDS this round, and was never explicitly resolved: "${String(e.text).slice(0, 160)}" - matching is by normalised text, so a REPHRASED restatement looks identical to a silence here; check whether it was reworded before concluding it was dropped. The panel does not hold convergence for it either way; a human must decide.`)
   }
-  resultBase.findings_ledger = findingsLedger   // resultBase is spread by every return below this point
+  // .map, not the array itself: prior_state below is handed `findingsLedger` too, and assigning the
+  // same reference to both made result.findings_ledger === prior_state.findings_ledger -- one array
+  // reachable through two names that are supposed to be a result and the state that produced it.
+  resultBase.findings_ledger = findingsLedger.map(e => (e && typeof e === 'object') ? { ...e } : e)   // resultBase is spread by every return below this point
   timingRounds = gate.timingRounds || timingRounds
   allLit = allLit.concat(prior.lit_conflicts || [], gate.litConflicts || [])
   // Demoted items accumulate across rounds. The cap of 200 exists purely to stop state bloat; when it
@@ -2700,7 +2778,7 @@ const claudeRound = await runClaudeRound(n, openP0s, shared)
 // because absence from one round's own verdict list says nothing about earlier entries.
 findingsLedger = buildFindingsLedger(n, findingsLedger.length ? findingsLedger : priorLedgerSeed,
   (claudeRound.auditors || []).flatMap(a => (a.parsed && a.parsed.p0) || []), false)
-resultBase.findings_ledger = findingsLedger
+resultBase.findings_ledger = findingsLedger.map(e => (e && typeof e === 'object') ? { ...e } : e)
 const codexBrief = (n === 1)
   ? rawSourceBrief()
   : sharedCodexBrief(n, shared, openP0s)
