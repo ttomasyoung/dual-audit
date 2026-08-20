@@ -574,8 +574,183 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
   const v4 = (await runPanel({ ...LD3, prior_state: v3.prior_state, codex_prev_verdict_raw: cxCleanReject(v3.task_fingerprint + '_r3'), codex_exit_code: 0 }, async () => P_B)).r
   const nr = (v4.findings_ledger || []).filter(e => e.status === 'not_restated')
   rec(nr.length >= 1, 'L16-pre the terminal really has a not_restated entry (else L16 passes on nothing)', `n=${nr.length}`)
-  rec(nr.length >= 1 && (v4.advisories || []).some(a => /NO LONGER restated/.test(String(a)) && /oct\.py:53/.test(String(a))),
+  // Matches on "not restated" rather than the exact former sentence: the wording changed when the
+  // advisory stopped claiming a finding had VANISHED (a paraphrase is indistinguishable from a
+  // silence to this matcher). What L16 is actually for is that the entry is NAMED, so that is what
+  // it pins -- the locator -- plus the weaker claim the panel can still support.
+  rec(nr.length >= 1 && (v4.advisories || []).some(a => /not restated/i.test(String(a)) && /oct\.py:53/.test(String(a))),
       'L16 a not_restated finding is NAMED in the terminal advisories, or nothing reads the ledger', `advisories=${(v4.advisories || []).length}`)
+}
+
+// ---- Group P: the six findings the release-diff-0820 panel returned ------------------
+// Each was measured before it was fixed, and each assertion here was confirmed red against
+// the pre-fix source. Two seats ran independently; where they disagreed (aliasing) the
+// assertion pins the stricter reading, because "nothing mutates it today" is the kind of
+// safety that stops holding without anything failing.
+{
+  console.log('\n=== Group P: release-diff audit findings ===')
+  const PD = { ...BSRC, mode: 'deep' }
+  const P_TWO = 'VERDICT: REJECT\nP0: zed.py:71 the retry loop never exits; zed.py:72 the lock is released twice\nEVIDENCE: read 4 files line 9\nVERIFIED: fail\nEND'
+  const P_ONE = 'VERDICT: REJECT\nP0: zed.py:71 the retry loop never exits\nEVIDENCE: re-read line 9 again\nVERIFIED: fail\nEND'
+  // The SAME finding as P_ONE, reworded by one word. To the normalised-text matcher this is
+  // indistinguishable from the finding having gone silent.
+  const P_REWORD = 'VERDICT: REJECT\nP0: zed.py:71 the retry loop never terminates\nEVIDENCE: re-read line 9 again\nVERIFIED: fail\nEND'
+  const pstep = async (prev, fn) => (await runPanel({ ...PD, prior_state: prev.prior_state,
+    codex_prev_verdict_raw: cxCleanReject(prev.task_fingerprint + '_r' + prev.prior_state.round), codex_exit_code: 0 }, fn)).r
+
+  const p1 = (await runPanel(PD, async () => P_TWO)).r
+  const p2 = await pstep(p1, async () => P_ONE)
+
+  // --- P1: ids must stay unique when the incoming ledger is not dense 1..n.
+  // The panel refuses a NON-ARRAY findings_ledger but does not validate entries inside one,
+  // so this state is accepted -- and `'F' + (out.length + 1)` then reissued an id in use.
+  const sparse = { ...p2.prior_state, findings_ledger: [
+    { id: 'F3', text: 'alpha', round_raised: 1, last_seen_round: 1, status: 'open' },
+    { id: 'F2', text: 'beta',  round_raised: 1, last_seen_round: 1, status: 'open' }] }
+  const pSp = (await runPanel({ ...PD, prior_state: sparse,
+    codex_prev_verdict_raw: cxCleanReject(p2.task_fingerprint + '_r' + p2.prior_state.round), codex_exit_code: 0 },
+    async () => P_TWO)).r
+  const spIds = (pSp.findings_ledger || []).map(e => e.id)
+  rec(spIds.length >= 3 && new Set(spIds).size === spIds.length,
+      'P1 ids stay unique when the incoming ledger is not dense 1..n (length asserted: Set on [] is vacuously fine)',
+      `ids=${JSON.stringify(spIds)}`)
+
+  // --- P7: the returned ledger must not BE the prior_state array. Measured identical by
+  // reference before the fix; nothing mutated it, which is why nothing failed.
+  rec(pSp.findings_ledger !== (pSp.prior_state && pSp.prior_state.findings_ledger),
+      'P7 the returned ledger is a copy, not the same array prior_state carries', 'same reference')
+
+  // --- P5: a rephrased restatement must not be reported as a disappearance.
+  const p3 = await pstep(p2, async () => P_REWORD)
+  const p4 = await pstep(p3, async () => P_REWORD)
+  const nrAdv = (p4.advisories || []).concat(p3.advisories || []).filter(a => /not restated|NO LONGER restated/i.test(String(a)))
+  rec(nrAdv.length === 0 || nrAdv.every(a => /MATCHING WORDS/.test(String(a)) && /REPHRASED|reworded/i.test(String(a))),
+      'P5 a non-restatement advisory says a paraphrase is indistinguishable from a silence',
+      JSON.stringify(nrAdv).slice(0, 260))
+
+  // --- P3/P4: a refused state must say what it carried, whatever prefix the blocker wore.
+  // `**P0**:` is one of the shapes test_panel.mjs already catalogues above; the old counter
+  // matched only a bare line-initial `P0:` and reported nothing at all for this state.
+  const BOLD = 'VERDICT: REJECT\n**P0**: the delete path removes user data\nEVIDENCE: read 3 files\nVERIFIED: fail\nEND'
+  const bad = { ...p2.prior_state, findings_ledger: 'not-an-array', claude_verdicts_raw: [BOLD] }
+  const pBad = (await runPanel({ ...PD, prior_state: bad,
+    codex_prev_verdict_raw: cxCleanReject(p2.task_fingerprint + '_r' + p2.prior_state.round), codex_exit_code: 0 },
+    async () => P_ONE)).r
+  const bl = JSON.stringify(pBad.blockers || [])
+  rec(/carried 1 verdict|carried \d+ verdict/.test(bl),
+      'P3 a refused state reports how many verdicts it carried (a count needing no parse)', bl.slice(0, 240))
+  rec(/FLOOR/.test(bl),
+      'P4 the P0 tally is labelled a floor, not a count, because prefix shapes it cannot match exist', bl.slice(0, 240))
+
+  // --- P6: the refusal that cannot prove the ledger complete must say so.
+  rec(pBad.ledger_incomplete === true,
+      'P6 the malformed-ledger refusal marks the ledger incomplete', `ledger_incomplete=${pBad.ledger_incomplete}`)
+
+  // --- P2: the seat-identity advisory is regenerated every round AND embeds a round-varying
+  // count, so exact-string dedup could not catch the carried copy. At most one per terminal.
+  // rolesUsable goes false when prior_state.claude_roles is blank, which is what these states do.
+  // A POSITIVE CONTROL comes first: without it "at most one" is satisfied by zero, and the first
+  // version of this test passed against the unfixed panel for exactly that reason.
+  const blankRoles = r => ({ ...r.prior_state, claude_roles: (r.prior_state.claude_roles || []).map(() => '') })
+  const sstep = async (prev, ps, fn) => (await runPanel({ ...PD, prior_state: ps,
+    codex_prev_verdict_raw: cxCleanReject(prev.task_fingerprint + '_r' + ps.round), codex_exit_code: 0 }, fn)).r
+  const s1 = (await runPanel(PD, async () => P_TWO)).r
+  const s2 = await sstep(s1, blankRoles(s1), async () => P_TWO)
+  const s3 = await sstep(s2, blankRoles(s2), async () => P_ONE)
+  const s4 = await sstep(s3, blankRoles(s3), async () => P_ONE)
+  const seatAt = r => (r.advisories || []).filter(a => /Seat identity was lost/.test(String(a)))
+  rec(seatAt(s2).length + seatAt(s3).length + seatAt(s4).length >= 1,
+      'P2-pre the seat-identity advisory is actually reached (else P2 is satisfied by zero)',
+      `counts=${[s2, s3, s4].map(r => seatAt(r).length).join(',')}`)
+  rec(seatAt(s4).length <= 1 && seatAt(s3).length <= 1,
+      'P2 at most one seat-identity advisory per terminal (it is regenerated, so it is not carried)',
+      `r3=${seatAt(s3).length} r4=${seatAt(s4).length}`)
+}
+
+// ---- Group Q: the three fixes Group P does not reach ---------------------------------
+{
+  console.log('\n=== Group Q: normaliser, give-up terminal, cap arithmetic ===')
+  const QD = { ...BSRC, mode: 'deep' }
+  // Two findings about two DIFFERENT files on a case-sensitive filesystem, identical otherwise.
+  const Q_CASE = 'VERDICT: REJECT\nP0: src/Foo.js:10 the handler swallows the error; src/foo.js:10 the handler swallows the error\nEVIDENCE: read 2 files line 4\nVERIFIED: fail\nEND'
+  const q1 = (await runPanel(QD, async () => Q_CASE)).r
+  const q2 = (await runPanel({ ...QD, prior_state: q1.prior_state,
+    codex_prev_verdict_raw: cxCleanReject(q1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => Q_CASE)).r
+  const qTexts = (q2.findings_ledger || []).map(e => e.text)
+  rec(qTexts.length >= 2 && qTexts.some(t => /src\/Foo\.js:10/.test(t)) && qTexts.some(t => /src\/foo\.js:10/.test(t)),
+      'Q1 findings about two files differing only in case stay TWO entries (case-folding merged them, losing one)',
+      JSON.stringify(qTexts))
+
+  // The give-up terminal: reached WITHOUT running the gate, so the merge inside the gate never
+  // happens. An advisory carried in from an earlier round has to survive here too -- this is the
+  // path a reader most needs earlier warnings on.
+  const CARRIED = '[ADVISORY] carried in from an earlier round and must survive the give-up terminal'
+  const qUn = (await runPanel({ ...QD,
+    prior_state: { ...q1.prior_state, codex_unavailable_streak: 1, advisory_carry: [CARRIED] },
+    codex_prev_verdict_raw: '', codex_exit_code: 1 }, async () => Q_CASE)).r
+  rec(qUn.convergence_status === 'codex_unavailable', 'Q2-pre the give-up terminal is actually reached', `status=${qUn.convergence_status}`)
+  rec((qUn.advisories || []).some(a => String(a) === CARRIED),
+      'Q2 a carried advisory survives the codex-unavailable terminal (it had no advisories key at all)',
+      `advisories=${JSON.stringify(qUn.advisories)}`)
+
+  // The cap: "200" must mean 200, and a second truncation must not forget what the first dropped.
+  const many = Array.from({ length: 260 }, (_, i) => `[ADVISORY] filler ${i}`)
+  const qCap = (await runPanel({ ...QD, prior_state: { ...q1.prior_state, advisory_carry: many },
+    codex_prev_verdict_raw: cxCleanReject(q1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => Q_CASE)).r
+  const carried = (qCap.prior_state && qCap.prior_state.advisory_carry) || []
+  const notices = carried.filter(a => /earlier advisory line\(s\) dropped/.test(String(a)))
+  rec(carried.length <= 200, 'Q3 the 200 cap yields at most 200 entries (slice-then-unshift produced 201)', `n=${carried.length}`)
+  rec(notices.length === 1, 'Q4 exactly one truncation notice is kept', `n=${notices.length}`)
+  // Truncate a second time: the new notice must include what the first one already dropped.
+  const first = Number((/(\d+) earlier/.exec(String(notices[0])) || [])[1] || 0)
+  const qCap2 = (await runPanel({ ...QD,
+    prior_state: { ...qCap.prior_state, advisory_carry: carried.concat(Array.from({ length: 60 }, (_, i) => `[ADVISORY] second wave ${i}`)) },
+    codex_prev_verdict_raw: cxCleanReject(qCap.task_fingerprint + '_r' + qCap.prior_state.round), codex_exit_code: 0 }, async () => Q_CASE)).r
+  const carried2 = (qCap2.prior_state && qCap2.prior_state.advisory_carry) || []
+  const second = Number((/(\d+) earlier/.exec(String(carried2.find(a => /earlier advisory line\(s\) dropped/.test(String(a))) || '')) || [])[1] || 0)
+  // `second >= first` is NOT discriminating: the pre-fix version also grew, it just restarted the
+  // tally from this pass. The claim that separates them is ACCOUNTING -- the notice must cover
+  // everything that did not survive, i.e. every line ever fed in minus the ones still present.
+  const everFed = 260 + 60
+  rec(first > 0 && second >= everFed - carried2.length,
+      'Q5 the notice accounts for ALL lines ever dropped, not just this truncation',
+      `first=${first} second=${second} everFed=${everFed} kept=${carried2.length} floor=${everFed - carried2.length}`)
+}
+
+// ---- Group R: the two the second round found that the first did not ------------------
+{
+  console.log('\n=== Group R: shielded ids, and the OTHER give-up terminal ===')
+  const RD = { ...BSRC, mode: 'deep' }
+  const R_A = 'VERDICT: REJECT\nP0: ohm.py:12 the buffer is reused after free\nEVIDENCE: read 3 files line 8\nVERIFIED: fail\nEND'
+  const r1 = (await runPanel(RD, async () => R_A)).r
+
+  // Two entries sharing one id. seenThisRound is keyed by id, so restating ONE marked the other
+  // seen as well, and a genuinely un-restated finding was handed to the reader as still open.
+  const twinned = { ...r1.prior_state, findings_ledger: [
+    { id: 'F1', text: 'ohm.py:12 the buffer is reused after free', round_raised: 1, last_seen_round: 1, status: 'open' },
+    { id: 'F1', text: 'ohm.py:99 a completely different finding',  round_raised: 1, last_seen_round: 1, status: 'open' }] }
+  const r2 = (await runPanel({ ...RD, prior_state: twinned,
+    codex_prev_verdict_raw: cxCleanReject(r1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => R_A)).r
+  const led = r2.findings_ledger || []
+  const ids = led.map(e => e.id)
+  rec(led.length >= 2 && new Set(ids).size === ids.length,
+      'R1 duplicate ids arriving in prior_state are repaired, not carried', JSON.stringify(ids))
+  const other = led.find(e => /ohm\.py:99/.test(e.text || ''))
+  rec(!!other && other.status === 'not_restated',
+      'R2 restating one entry does not shield its id-twin from being marked (it was reported open)',
+      other ? `status=${other.status}` : 'entry missing')
+
+  // The give-up terminal that is NOT codex_unavailable: codex is unusable AND last_codex_brief is
+  // gone. Round 1 found the first such return; there were three, which is why the carry now lives
+  // on resultBase instead of being pasted into each one.
+  const CARRIED = '[ADVISORY] raised earlier and must survive every give-up terminal'
+  const { last_codex_brief: _gone, ...noBrief } = r1.prior_state
+  const rMB = (await runPanel({ ...RD, prior_state: { ...noBrief, advisory_carry: [CARRIED] },
+    codex_prev_verdict_raw: '', codex_exit_code: 1 }, async () => R_A)).r
+  rec(rMB.convergence_status === 'prior_state_missing_brief',
+      'R3-pre the missing-brief terminal is actually reached', `status=${rMB.convergence_status}`)
+  rec((rMB.advisories || []).some(a => String(a) === CARRIED),
+      'R3 a carried advisory survives the missing-brief terminal too', `advisories=${JSON.stringify(rMB.advisories)}`)
 }
 
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
