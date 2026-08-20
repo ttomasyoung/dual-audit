@@ -1887,7 +1887,12 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
   // prompt, and those embed round-varying text (a count of approving verdicts, the auditor's own
   // claim list), so they can never rematch and get marked not_restated while the gate that
   // produced them is still firing. A directive is not a finding; the ledger takes findings only.
-  return { advisories, converged, carry, findings: newP0s.slice(), demoted: demotedP0s, p0Count: newP0s.length, unanchored, litConflicts, claimGap, codeGap, blockers, codes: [], runFindingsConditional, timingRounds }
+  // One-off observation vs regenerated every round. SEQUENCING is recomputed from
+  // timing_advisory_rounds, so carrying it as well makes it appear TWICE -- and E-carry asserts
+  // exactly one, which is how the previous attempt at this repair broke it. Everything else here
+  // is a one-off reading of the verdict being adjudicated: not carried, it dies with its round.
+  const advisoriesOneOff = advisories.filter(a => !/^\[ADVISORY\] SEQUENCING/.test(String(a)))
+  return { advisories, advisoriesOneOff, converged, carry, findings: newP0s.slice(), demoted: demotedP0s, p0Count: newP0s.length, unanchored, litConflicts, claimGap, codeGap, blockers, codes: [], runFindingsConditional, timingRounds }
 }
 
 // ============================ MAIN: two-phase, one round per invocation ============================
@@ -1921,6 +1926,8 @@ const priorLedgerRaw = prior ? prior.findings_ledger : undefined
 const priorLedgerMalformed = !!prior && priorLedgerRaw !== undefined && !Array.isArray(priorLedgerRaw)
 const priorLedgerAbsent = !!prior && priorLedgerRaw === undefined
 const priorLedgerSeed = Array.isArray(priorLedgerRaw) ? priorLedgerRaw.slice() : []
+const priorAdvisoryCarry = (prior && Array.isArray(prior.advisory_carry)) ? prior.advisory_carry.slice() : []
+let advisoryCarry = priorAdvisoryCarry.slice()
 // Once incomplete, always incomplete: a later round cannot restore what an earlier state never carried.
 const ledgerIncomplete = priorLedgerAbsent || (!!prior && prior.ledger_incomplete === true)
 let identityOk = false
@@ -2369,6 +2376,20 @@ if (prevCodexRaw && prior) {
   }
   const gate = evaluateConvergence(priorRound, priorClaudeRound, codexParsed, codexInvalid, prior.timing_advisory_rounds)
   findingsLedger = buildFindingsLedger(priorRound, priorLedgerSeed, gate.findings)
+  // 🔴 AUDIT panel-self-0818 (P0 #1/#2/#7) — an advisory generated while adjudicating an earlier
+  // round reached only that round's result, and the driver returns only the last one.  Measured:
+  // the blocker-smuggling advisory ("a real blocker is written in EVIDENCE while the gating field
+  // says none — a human should look") was generated at call 2 and was GONE by call 3.
+  // Carry the one-off ones; the regenerated SEQUENCING note is excluded at the source, because
+  // carrying it too made it appear twice and broke E-carry (which asserts exactly one).
+  const ADVISORY_CARRY_CAP = 200
+  for (const a of (gate.advisoriesOneOff || [])) if (!advisoryCarry.includes(a)) advisoryCarry.push(a)
+  if (advisoryCarry.length > ADVISORY_CARRY_CAP) {
+    const dropped = advisoryCarry.length - ADVISORY_CARRY_CAP
+    advisoryCarry = advisoryCarry.slice(-ADVISORY_CARRY_CAP)
+    advisoryCarry.unshift(`[ADVISORY] ${dropped} earlier advisory line(s) dropped at the ${ADVISORY_CARRY_CAP} cap — said out loud so the truncation is never silent.`)
+  }
+  gate.advisories = gate.advisories.concat(advisoryCarry.filter(a => !gate.advisories.includes(a)))
 
   // A finding that stops being restated does not block, but it must not be silently absent from what
   // a human reads. Without this the ledger has NO reader anywhere -- not the driver, not the triage
@@ -2732,6 +2753,7 @@ return {
     lit_conflicts: allLit,
     open_p0s: openP0s,                              // surfaced if codex goes unavailable (false-death escalate path)
     findings_ledger: findingsLedger,                // monotonic: an entry is marked, never removed
+    advisory_carry: advisoryCarry,                  // one-off advisories, or they die with their round
     // Threaded like demoted_p0_log and timing_advisory_rounds, and for the same reason: written
     // only onto this round's result it survives exactly ONE invocation, and the next round then
     // presents a ledger it cannot prove complete as complete.
