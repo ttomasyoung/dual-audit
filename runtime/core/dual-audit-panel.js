@@ -1758,7 +1758,7 @@ function buildFindingsLedger(n, priorLedger, carry, markAbsent = true) {
   return out
 }
 
-function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTimingRounds) {
+function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTimingRounds, priorSeatRounds) {
   const claudeAuditors = (claudeRound.auditors || [])
   const valid = []
   for (const a of claudeAuditors) if (a.parsed && a.parsed.valid) valid.push({ kind: 'claude', parsed: a.parsed })
@@ -1907,8 +1907,16 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
   // 🔴 Independent of the if/else chain above: when seat identity is broken, say so WHETHER OR NOT the
   // sequencing note fired. The first version made this an else-if and a probe refuted it immediately -
   // when roles is truncated to half-right, the surviving half makes runFindingsConditional true by
+  const seatRounds = (Array.isArray(priorSeatRounds) ? priorSeatRounds : []).slice()
+  if (!rolesUsable && (logicSeatP0 + runSeatP0) > 0 && !seatRounds.includes(n)) seatRounds.push(n)
   if (!rolesUsable && (logicSeatP0 + runSeatP0) > 0) {
-    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit (prior_state.claude_roles missing / length disagrees with the verdict array / all empty). The seat attribution of this round's ${logicSeatP0 + runSeatP0} P0(s) is NOT trustworthy - the sequencing check cannot be made this round, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
+    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit (prior_state.claude_roles missing / length disagrees with the verdict array / all empty). The seat attribution of ROUND ${n}'s ${logicSeatP0 + runSeatP0} P0(s) is NOT trustworthy - the sequencing check cannot be made for that round, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
+  } else if (seatRounds.length) {
+    // Re-emitted, not carried: exactly the SEQUENCING shape. One line, naming the rounds, so a
+    // reader of the FINAL result still learns that some earlier round's seat attribution was
+    // untrustworthy. Excluding it from the carry without this branch removed the warning instead
+    // of de-duplicating it, which is the erasure this whole exercise is about.
+    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit in round ${seatRounds.join('/')} (carried forward to here): the seat attribution of that round's P0(s) is NOT trustworthy, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
   }
   // findings: the P0s THEMSELVES. carry is findings PLUS directives written for the next round's
   // prompt, and those embed round-varying text (a count of approving verdicts, the auditor's own
@@ -1924,7 +1932,7 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
   // all reading "this round's N P0(s)" for different N, none saying which round it meant.
   const REGENERATED_EVERY_ROUND = /^\[ADVISORY\] (SEQUENCING|Seat identity was lost)/
   const advisoriesOneOff = advisories.filter(a => !REGENERATED_EVERY_ROUND.test(String(a)))
-  return { advisories, advisoriesOneOff, converged, carry, findings: newP0s.slice(), demoted: demotedP0s, p0Count: newP0s.length, unanchored, litConflicts, claimGap, codeGap, blockers, codes: [], runFindingsConditional, timingRounds }
+  return { advisories, advisoriesOneOff, converged, carry, findings: newP0s.slice(), demoted: demotedP0s, p0Count: newP0s.length, unanchored, litConflicts, claimGap, codeGap, blockers, codes: [], runFindingsConditional, timingRounds, seatRounds }
 }
 
 // ============================ MAIN: two-phase, one round per invocation ============================
@@ -1960,6 +1968,10 @@ const priorLedgerAbsent = !!prior && priorLedgerRaw === undefined
 const priorLedgerSeed = Array.isArray(priorLedgerRaw) ? priorLedgerRaw.slice() : []
 const priorAdvisoryCarry = (prior && Array.isArray(prior.advisory_carry)) ? prior.advisory_carry.slice() : []
 let advisoryCarry = priorAdvisoryCarry.slice()
+// Seeded HERE, above every shapeAbort call, not next to the ledger seed further down. shapeAbort
+// does spread ...resultBase; it simply runs before that later line, so the spread copied an object
+// that did not have the key yet and each refusal reported advisories: undefined.
+resultBase.advisories = advisoryCarry.slice()
 // Once incomplete, always incomplete: a later round cannot restore what an earlier state never carried.
 const ledgerIncomplete = priorLedgerAbsent || (!!prior && prior.ledger_incomplete === true)
 let identityOk = false
@@ -2183,9 +2195,9 @@ resultBase.findings_ledger = priorLedgerSeed.map(e => (e && typeof e === 'object
 // Same reasoning for the carried advisories, one level up: a return that gives up reaches the
 // reader through `...resultBase` and nothing else, so seeding it here covers every such exit at
 // once. A path that computes real advisories overrides this by setting the key after the spread.
-resultBase.advisories = advisoryCarry.slice()
 if (ledgerIncomplete) resultBase.ledger_incomplete = true
 let timingRounds = (prior && Array.isArray(prior.timing_advisory_rounds)) ? prior.timing_advisory_rounds.slice() : []
+let seatRounds = (prior && Array.isArray(prior.seat_identity_rounds)) ? prior.seat_identity_rounds.slice() : []
 let priorConvergenceNote = null
 // ---- false-death handling: codex did NOT produce a trustworthy verdict for prior.round
 // (empty stdout OR nonzero exit OR a MISSING/malformed exit code alongside complete-looking stdout — see A2:
@@ -2433,7 +2445,7 @@ if (prevCodexRaw && prior) {
       return rs.every((x, i) => String(x == null ? '' : x).trim() === SEAT_ROLES[i])
     })(),
   }
-  const gate = evaluateConvergence(priorRound, priorClaudeRound, codexParsed, codexInvalid, prior.timing_advisory_rounds)
+  const gate = evaluateConvergence(priorRound, priorClaudeRound, codexParsed, codexInvalid, prior.timing_advisory_rounds, prior.seat_identity_rounds)
   findingsLedger = buildFindingsLedger(priorRound, priorLedgerSeed, gate.findings)
   // 🔴 AUDIT panel-self-0818 (P0 #1/#2/#7) — an advisory generated while adjudicating an earlier
   // round reached only that round's result, and the driver returns only the last one.  Measured:
@@ -2480,6 +2492,7 @@ if (prevCodexRaw && prior) {
   // reachable through two names that are supposed to be a result and the state that produced it.
   resultBase.findings_ledger = findingsLedger.map(e => (e && typeof e === 'object') ? { ...e } : e)   // resultBase is spread by every return below this point
   timingRounds = gate.timingRounds || timingRounds
+  seatRounds = gate.seatRounds || seatRounds
   allLit = allLit.concat(prior.lit_conflicts || [], gate.litConflicts || [])
   // Demoted items accumulate across rounds. The cap of 200 exists purely to stop state bloat; when it
   // truncates it SAYS how many were dropped and never drops silently - a silently dropped P0 and a
@@ -2828,6 +2841,7 @@ return {
     // Which rounds raised the sequencing note. Same reason as demoted_p0_log: written only into this
     // round's advisories it is absent from the final result in full-run mode, because the driver
     timing_advisory_rounds: timingRounds,
+    seat_identity_rounds: seatRounds,
     lit_conflicts: allLit,
     open_p0s: openP0s,                              // surfaced if codex goes unavailable (false-death escalate path)
     findings_ledger: findingsLedger,                // monotonic: an entry is marked, never removed

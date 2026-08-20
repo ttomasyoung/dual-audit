@@ -624,7 +624,10 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
   const p3 = await pstep(p2, async () => P_REWORD)
   const p4 = await pstep(p3, async () => P_REWORD)
   const nrAdv = (p4.advisories || []).concat(p3.advisories || []).filter(a => /not restated|NO LONGER restated/i.test(String(a)))
-  rec(nrAdv.length === 0 || nrAdv.every(a => /MATCHING WORDS/.test(String(a)) && /REPHRASED|reworded/i.test(String(a))),
+  // POSITIVE CONTROL first: the `length === 0 ||` form below is satisfied by the advisory never
+  // being emitted at all, so without this it would go green the day the emission breaks.
+  rec(nrAdv.length >= 1, 'P5-pre a non-restatement advisory is actually emitted (else P5 is satisfied by zero)', `n=${nrAdv.length}`)
+  rec(nrAdv.length >= 1 && nrAdv.every(a => /MATCHING WORDS/.test(String(a)) && /REPHRASED|reworded/i.test(String(a))),
       'P5 a non-restatement advisory says a paraphrase is indistinguishable from a silence',
       JSON.stringify(nrAdv).slice(0, 260))
 
@@ -699,7 +702,9 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
     codex_prev_verdict_raw: cxCleanReject(q1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => Q_CASE)).r
   const carried = (qCap.prior_state && qCap.prior_state.advisory_carry) || []
   const notices = carried.filter(a => /earlier advisory line\(s\) dropped/.test(String(a)))
-  rec(carried.length <= 200, 'Q3 the 200 cap yields at most 200 entries (slice-then-unshift produced 201)', `n=${carried.length}`)
+  // Lower bound as well: `<= 200` alone is satisfied by an empty carry, which is the failure the
+  // cap is not supposed to cause. 260 went in, so a healthy cap keeps exactly 200.
+  rec(carried.length === 200, 'Q3 the 200 cap yields exactly 200 entries (slice-then-unshift produced 201; an empty carry would also satisfy <=200)', `n=${carried.length}`)
   rec(notices.length === 1, 'Q4 exactly one truncation notice is kept', `n=${notices.length}`)
   // Truncate a second time: the new notice must include what the first one already dropped.
   const first = Number((/(\d+) earlier/.exec(String(notices[0])) || [])[1] || 0)
@@ -751,6 +756,58 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
       'R3-pre the missing-brief terminal is actually reached', `status=${rMB.convergence_status}`)
   rec((rMB.advisories || []).some(a => String(a) === CARRIED),
       'R3 a carried advisory survives the missing-brief terminal too', `advisories=${JSON.stringify(rMB.advisories)}`)
+}
+
+// ---- Group S: what the delta round found in the repairs themselves --------------------
+{
+  console.log('\n=== Group S: the repairs\' own defects ===')
+  const SD = { ...BSRC, mode: 'deep' }
+  const S_TWO = 'VERDICT: REJECT\nP0: sig.py:14 the digest is computed over the wrong slice; sig.py:15 the retry never backs off\nEVIDENCE: read 4 files line 7\nVERIFIED: fail\nEND'
+  const blank = r => ({ ...r.prior_state, claude_roles: (r.prior_state.claude_roles || []).map(() => '') })
+  const sstep = async (prev, ps, fn) => (await runPanel({ ...SD, prior_state: ps,
+    codex_prev_verdict_raw: cxCleanReject(prev.task_fingerprint + '_r' + ps.round), codex_exit_code: 0 }, fn)).r
+
+  // Seat identity is unusable at ROUND 2 ONLY. The driver returns only the LAST result, so unless
+  // the warning is re-emitted with the round named, a reader of the final verdict never learns
+  // that round 2's seat attribution was untrustworthy. Excluding it from the carry silenced it.
+  // OBSERVATION POINT: a handoff's top-level `advisories` is empty BY DESIGN (its content lives in
+  // prior_round_note), so asserting on calls 2 or 3 measures nothing -- the first version of this
+  // test did exactly that and read 0 against the fixed panel too. In deep mode the terminal is the
+  // FOURTH call. Roles are unusable only while adjudicating round 1; rounds 2 and 3 are clean, so
+  // an implementation that merely stops duplicating the warning shows zero here.
+  const t1 = (await runPanel(SD, async () => S_TWO)).r
+  const t2 = await sstep(t1, blank(t1), async () => S_TWO)          // roles unusable for round 1
+  const t3 = await sstep(t2, t2.prior_state, async () => S_TWO)     // roles fine again
+  const t4 = await sstep(t3, t3.prior_state, async () => S_TWO)     // terminal
+  const seatAt = r => (r.advisories || []).filter(a => /Seat identity was lost/.test(String(a)))
+  rec(t4.convergence_status === 'not_converged', 'S1-pre the fourth call really is the terminal', `status=${t4.convergence_status}`)
+  rec(seatAt(t4).length === 1,
+      'S1 the terminal still carries the warning from the round that had it (excluding it deleted it)',
+      `n=${seatAt(t4).length}`)
+  rec(seatAt(t4).some(a => /in round 1\b/.test(String(a))),
+      'S2 the carried warning NAMES the round it is about (the original complaint was that none did)',
+      JSON.stringify(seatAt(t4)).slice(0, 200))
+
+  // A refusal must carry the advisories too. shapeAbort spreads ...resultBase, but the seed used
+  // to sit BELOW every shapeAbort call, so the spread copied an object without the key.
+  const CARRIED = '[ADVISORY] raised earlier and must survive a refusal too'
+  const bad = { ...t1.prior_state, findings_ledger: 'not-an-array', advisory_carry: [CARRIED] }
+  const tBad = (await runPanel({ ...SD, prior_state: bad,
+    codex_prev_verdict_raw: cxCleanReject(t1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => S_TWO)).r
+  rec(tBad.convergence_status === 'prior_state_findings_ledger_malformed', 'S3-pre the refusal is actually reached', `status=${tBad.convergence_status}`)
+  rec((tBad.advisories || []).some(a => String(a) === CARRIED),
+      'S3 a refusal carries the advisories it was handed (it reported advisories: undefined)',
+      `advisories=${JSON.stringify(tBad.advisories)}`)
+
+  // The floor must be the RIGHT number, not merely present: forcing it to 0 left every assertion
+  // green, so nothing pinned the count itself.
+  const IND = 'VERDICT: REJECT\n  P0: sig.py:14 the digest is computed over the wrong slice\nEVIDENCE: read 3 files\nVERIFIED: fail\nEND'
+  const bad2 = { ...t1.prior_state, findings_ledger: 'not-an-array', claude_verdicts_raw: [IND] }
+  const tInd = (await runPanel({ ...SD, prior_state: bad2,
+    codex_prev_verdict_raw: cxCleanReject(t1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => S_TWO)).r
+  const bl = JSON.stringify(tInd.blockers || [])
+  rec(/At least 1 of them declare a P0/.test(bl),
+      'S4 an INDENTED P0 line counts toward the floor (the shape the panel\'s own parser accepts)', bl.slice(0, 260))
 }
 
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
