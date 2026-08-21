@@ -810,5 +810,51 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
       'S4 an INDENTED P0 line counts toward the floor (the shape the panel\'s own parser accepts)', bl.slice(0, 260))
 }
 
+// ---- Group T: what the second verification round found in the previous five repairs ---
+{
+  console.log('\n=== Group T: identity-before-relay, and naming every affected round ===')
+  const TD = { ...BSRC, mode: 'deep' }
+  const T_V = 'VERDICT: REJECT\nP0: rho.py:8 the writer never flushes\nEVIDENCE: read 3 files line 5\nVERIFIED: fail\nEND'
+  const FOREIGN = '[ADVISORY] belongs to a DIFFERENT audit and must not be relayed under this one'
+  const t1 = (await runPanel(TD, async () => T_V)).r
+
+  // T1: a state that FAILS the identity check may not have its advisories relayed. Above the
+  // identity gate `prior` can belong to another audit entirely -- the neighbouring demoted_p0
+  // seed is held back for exactly this reason, and seeding advisories earlier broke that rule.
+  const foreign = { ...t1.prior_state, task_fingerprint: 'fp_someone_elses_audit', advisory_carry: [FOREIGN] }
+  const tF = (await runPanel({ ...TD, prior_state: foreign,
+    codex_prev_verdict_raw: cxCleanReject(t1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => T_V)).r
+  rec(/fingerprint|mismatch|malformed|run_id/i.test(String(tF.convergence_status)),
+      'T1-pre the foreign state really is refused on identity', `status=${tF.convergence_status}`)
+  rec(!(tF.advisories || []).some(a => String(a) === FOREIGN),
+      'T1 a state refused on IDENTITY does not relay its advisories under this audit',
+      `advisories=${JSON.stringify(tF.advisories)}`)
+
+  // T2: over-correction guard. A refusal AFTER identity is confirmed must still carry them --
+  // that was the whole point of the previous repair, and moving the seed must not undo it.
+  const ours = { ...t1.prior_state, findings_ledger: 'not-an-array', advisory_carry: [FOREIGN] }
+  const tO = (await runPanel({ ...TD, prior_state: ours,
+    codex_prev_verdict_raw: cxCleanReject(t1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => T_V)).r
+  rec(tO.convergence_status === 'prior_state_findings_ledger_malformed', 'T2-pre the post-identity refusal is reached', `status=${tO.convergence_status}`)
+  rec((tO.advisories || []).some(a => String(a) === FOREIGN),
+      'T2 a refusal AFTER identity is confirmed still carries them (do not over-correct T1)',
+      `advisories=${JSON.stringify(tO.advisories)}`)
+
+  // T3: roles broken in round 1 AND again in the terminal round. The if/else this replaces
+  // emitted only the current round whenever the current round was broken, so a terminal that
+  // was itself broken said nothing about round 1 and the reader trusted it.
+  const blank = r => ({ ...r.prior_state, claude_roles: (r.prior_state.claude_roles || []).map(() => '') })
+  const st = async (prev, ps) => (await runPanel({ ...TD, prior_state: ps,
+    codex_prev_verdict_raw: cxCleanReject(prev.task_fingerprint + '_r' + ps.round), codex_exit_code: 0 }, async () => T_V)).r
+  const u2 = await st(t1, blank(t1))          // round 1 roles unusable
+  const u3 = await st(u2, u2.prior_state)     // clean
+  const u4 = await st(u3, blank(u3))          // terminal, ALSO unusable
+  const seat = (u4.advisories || []).filter(a => /Seat identity was lost/.test(String(a)))
+  rec(seat.length === 1, 'T3-pre exactly one seat-identity line at the terminal', `n=${seat.length}`)
+  rec(seat.length === 1 && /round .*1/.test(String(seat[0])) && /3/.test(String(seat[0])),
+      'T3 the line names EVERY affected round, not only the current one',
+      JSON.stringify(seat).slice(0, 240))
+}
+
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
 if (fail) process.exit(1)

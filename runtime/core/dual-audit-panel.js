@@ -1909,9 +1909,13 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
   // when roles is truncated to half-right, the surviving half makes runFindingsConditional true by
   const seatRounds = (Array.isArray(priorSeatRounds) ? priorSeatRounds : []).slice()
   if (!rolesUsable && (logicSeatP0 + runSeatP0) > 0 && !seatRounds.includes(n)) seatRounds.push(n)
-  if (!rolesUsable && (logicSeatP0 + runSeatP0) > 0) {
-    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit (prior_state.claude_roles missing / length disagrees with the verdict array / all empty). The seat attribution of ROUND ${n}'s ${logicSeatP0 + runSeatP0} P0(s) is NOT trustworthy - the sequencing check cannot be made for that round, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
-  } else if (seatRounds.length) {
+  // ONE line naming EVERY affected round. The if/else this replaces emitted only the current
+  // round when the current round was broken, so a terminal that was itself broken said nothing
+  // about earlier broken rounds already sitting in seatRounds, and the reader trusted them.
+  if (seatRounds.length) {
+    const cur = !rolesUsable && (logicSeatP0 + runSeatP0) > 0
+    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit (prior_state.claude_roles missing / length disagrees with the verdict array / all empty) in round ${seatRounds.join('/')}${cur ? ` (including THIS round, ${logicSeatP0 + runSeatP0} P0(s))` : ' (carried forward to here)'}. The seat attribution of those rounds' P0(s) is NOT trustworthy - the sequencing check cannot be made for them, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
+  } else if (false) {
     // Re-emitted, not carried: exactly the SEQUENCING shape. One line, naming the rounds, so a
     // reader of the FINAL result still learns that some earlier round's seat attribution was
     // untrustworthy. Excluding it from the carry without this branch removed the warning instead
@@ -1968,10 +1972,6 @@ const priorLedgerAbsent = !!prior && priorLedgerRaw === undefined
 const priorLedgerSeed = Array.isArray(priorLedgerRaw) ? priorLedgerRaw.slice() : []
 const priorAdvisoryCarry = (prior && Array.isArray(prior.advisory_carry)) ? prior.advisory_carry.slice() : []
 let advisoryCarry = priorAdvisoryCarry.slice()
-// Seeded HERE, above every shapeAbort call, not next to the ledger seed further down. shapeAbort
-// does spread ...resultBase; it simply runs before that later line, so the spread copied an object
-// that did not have the key yet and each refusal reported advisories: undefined.
-resultBase.advisories = advisoryCarry.slice()
 // Once incomplete, always incomplete: a later round cannot restore what an earlier state never carried.
 const ledgerIncomplete = priorLedgerAbsent || (!!prior && prior.ledger_incomplete === true)
 let identityOk = false
@@ -2064,6 +2064,11 @@ if (prior) {
 // Identity confirmed (both the fingerprint gate and the run_id gate passed): from here on a terminal
 // can prove prior belongs to THIS audit, so prior.demoted_p0_log may be carried. The position of
 identityOk = true
+// Seeded HERE and not earlier, for the same reason priorDemotedSeed is: above this line `prior`
+// may belong to a DIFFERENT audit, and relaying its advisories would attribute another audit's
+// warnings to this task and project. Every refusal from here down still carries them -- which is
+// what those refusals were missing -- while the pre-identity aborts stay silent, correctly.
+resultBase.advisories = advisoryCarry.slice()
 if (priorLedgerMalformed) return shapeAbort('prior_state_findings_ledger_malformed',
   'prior_state.findings_ledger is present but is not an array — the ledger cannot be proven complete, and silently treating it as empty is exactly the erasure this field exists to prevent',
   'thread the prior_state returned by the previous call verbatim; do not hand-assemble it')
