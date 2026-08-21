@@ -770,10 +770,13 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
   // Seat identity is unusable at ROUND 2 ONLY. The driver returns only the LAST result, so unless
   // the warning is re-emitted with the round named, a reader of the final verdict never learns
   // that round 2's seat attribution was untrustworthy. Excluding it from the carry silenced it.
-  // OBSERVATION POINT: a handoff's top-level `advisories` is empty BY DESIGN (its content lives in
-  // prior_round_note), so asserting on calls 2 or 3 measures nothing -- the first version of this
-  // test did exactly that and read 0 against the fixed panel too. In deep mode the terminal is the
-  // FOURTH call. Roles are unusable only while adjudicating round 1; rounds 2 and 3 are clean, so
+  // OBSERVATION POINT: advisories GENERATED while adjudicating a round do not appear at a
+  // handoff's top level -- they live in prior_round_note -- so asserting on calls 2 or 3 measures
+  // nothing, which the first version of this test did, reading 0 against the fixed panel too.
+  // In deep mode the terminal is the FOURTH call.
+  // ⚠️ NOT "the top-level field is empty by design": measured, a handoff DOES carry whatever was
+  // in advisory_carry. That earlier wording was an overstatement and a future assertion built on
+  // it ("a handoff must have zero advisories") would be wrong. Roles are unusable only while adjudicating round 1; rounds 2 and 3 are clean, so
   // an implementation that merely stops duplicating the warning shows zero here.
   const t1 = (await runPanel(SD, async () => S_TWO)).r
   const t2 = await sstep(t1, blank(t1), async () => S_TWO)          // roles unusable for round 1
