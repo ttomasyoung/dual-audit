@@ -776,8 +776,9 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
   // In deep mode the terminal is the FOURTH call.
   // ⚠️ NOT "the top-level field is empty by design": measured, a handoff DOES carry whatever was
   // in advisory_carry. That earlier wording was an overstatement and a future assertion built on
-  // it ("a handoff must have zero advisories") would be wrong. Roles are unusable only while adjudicating round 1; rounds 2 and 3 are clean, so
-  // an implementation that merely stops duplicating the warning shows zero here.
+  // it ("a handoff must have zero advisories") would be wrong.
+  // Roles are unusable only while adjudicating round 1; rounds 2 and 3 are clean, so an
+  // implementation that merely stops duplicating the warning shows zero here.
   const t1 = (await runPanel(SD, async () => S_TWO)).r
   const t2 = await sstep(t1, blank(t1), async () => S_TWO)          // roles unusable for round 1
   const t3 = await sstep(t2, t2.prior_state, async () => S_TWO)     // roles fine again
@@ -857,6 +858,43 @@ console.log(`[note] ${threwNote} mutant(s) crashed rather than failing an assert
   rec(seat.length === 1 && /round .*1/.test(String(seat[0])) && /3/.test(String(seat[0])),
       'T3 the line names EVERY affected round, not only the current one',
       JSON.stringify(seat).slice(0, 240))
+}
+
+// ---- Group U: the P1s the fourth round raised -----------------------------------------
+// The dead `else if (false)` branch that round also flagged is NOT tested here, and saying so
+// is the point: removing it has no behavioural delta (it was unreachable), so any test claiming
+// to pin it would be asserting on nothing. It was removed because a four-line comment describing
+// code that can never run reads as live to the next person, not because it did anything.
+{
+  console.log('\n=== Group U: refusal shape, and junk in a human-facing line ===')
+  const UD = { ...BSRC, mode: 'deep' }
+  const U_V = 'VERDICT: REJECT\nP0: pi.py:3 the index is off by one; pi.py:4 the lock leaks\nEVIDENCE: read 2 files line 6\nVERIFIED: fail\nEND'
+  const u1 = (await runPanel(UD, async () => U_V)).r
+
+  // U1: a pre-identity refusal must not RELAY a foreign state's advisories, but it should still
+  // return the KEY. resultBase declares findings_ledger: [] for exactly this reason -- a reader
+  // meeting `undefined` cannot tell "none" from "this build does not have the field".
+  const foreign = { ...u1.prior_state, task_fingerprint: 'fp_someone_elses', advisory_carry: ['[ADVISORY] foreign'] }
+  const uF = (await runPanel({ ...UD, prior_state: foreign,
+    codex_prev_verdict_raw: cxCleanReject(u1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => U_V)).r
+  rec(/mismatch|malformed|invalid/i.test(String(uF.convergence_status)), 'U1-pre the pre-identity refusal is reached', `status=${uF.convergence_status}`)
+  rec(Object.prototype.hasOwnProperty.call(uF, 'advisories') && Array.isArray(uF.advisories) && uF.advisories.length === 0,
+      'U1 a pre-identity refusal returns advisories as an empty ARRAY, not an absent key',
+      `hasKey=${Object.prototype.hasOwnProperty.call(uF, 'advisories')} value=${JSON.stringify(uF.advisories)}`)
+
+  // U2: seat_identity_rounds comes from prior_state, which is not validated element-wise, and is
+  // interpolated into a line a human reads. Measured by an auditor as `in round <script>//[object
+  // Object]` before this was constrained to integers.
+  const junk = { ...u1.prior_state, seat_identity_rounds: ['<script>', {}, 7],
+                 claude_roles: (u1.prior_state.claude_roles || []).map(() => '') }
+  const uJ = (await runPanel({ ...UD, prior_state: junk,
+    codex_prev_verdict_raw: cxCleanReject(u1.task_fingerprint + '_r1'), codex_exit_code: 0 }, async () => U_V)).r
+  const seatLines = (((uJ.prior_round_note || {}).advisories) || []).concat(uJ.advisories || [])
+                    .filter(a => /Seat identity was lost/.test(String(a)))
+  rec(seatLines.length >= 1, 'U2-pre a seat-identity line is actually produced (else U2 is satisfied by zero)', `n=${seatLines.length}`)
+  rec(seatLines.length >= 1 && !seatLines.some(a => /<script>|\[object Object\]/.test(String(a))),
+      'U2 junk from prior_state does not reach the human-facing line',
+      JSON.stringify(seatLines).slice(0, 200))
 }
 
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
