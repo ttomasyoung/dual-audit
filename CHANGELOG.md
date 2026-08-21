@@ -5,6 +5,48 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.2.0]
+
+**Read this first if anything you own branches on `terminal_state` or `converged`.** A run with
+one reviewer seat now returns `CONVERGED_SINGLE_SEAT`, not `CONVERGED`. Code written as
+`=== 'CONVERGED'` will stop matching those runs. That is the point: a single-seat run converged on
+one reading with no cross-examination, and reporting it with the same string as a real dual audit
+made the two machine-indistinguishable. The prose said "single seat"; nothing that branches reads
+prose. The driver forces `converged: false` for anything that is not `CONVERGED`, so the new value
+reads as *less* than approval, never as nothing.
+
+**Findings are now recorded in a ledger that never removes an entry.** `open_p0s` was replaced
+each round by that round's adjudicated findings, so a finding raised earlier that nobody restated
+disappeared from every later result while the run still reported convergence — a consumer received
+an approval covering a finding that had evaporated, and "nobody found anything" was byte-identical
+to "the finding was dropped". Entries carry an opaque sequence id, the round that raised them, and
+`open` / `not_restated`.
+
+The ledger **gates nothing**, deliberately. This code cannot tell a refutation from a silence, and
+blocking on every non-restated finding would deadlock ordinary runs. Naming the state is what a
+human needs; deciding it is not something the panel can do. For the same reason, matching a
+restatement to its entry is a heuristic (normalised text), and on no match a *new* entry is created
+rather than merged — a duplicate is recoverable, an erased finding is not. Matching is
+case-sensitive, because findings are `file:line` locators and two paths differing only in case are
+two different files.
+
+**`codex_only` works for `kind: code` and `kind: mixed`.** The code gate required a passing verdict
+from a Claude run seat, and that mode dispatches none, so those combinations could never converge
+and emitted that impossibility as their sole blocker — which read like a finding about the code
+under review. A gate nothing can satisfy is not a gate. Single-seat runs now converge on the static
+reading and say, loudly, that nothing was executed.
+
+**Terminals that give up now carry what they were handed.** A refusal, a codex-unavailable exit and
+a missing-brief exit each returned no advisories at all, and a refusal that could not prove the
+ledger complete said nothing about what the refused state contained. The paths where the panel
+admits it cannot finish are the paths a reader most needs the earlier warnings on.
+
+Smaller, same shape: a refusal reports how many verdicts it carried (a count needing no parse) and
+labels any P0 tally a floor rather than a count; advisories raised while adjudicating an earlier
+round survive to the terminal instead of dying with their round; the seat-identity warning is
+re-emitted naming the round it describes instead of being dropped once a later round is clean; the
+advisory cap of 200 means 200 and its truncation notice accumulates across truncations.
+
 ## [1.1.1]
 
 `codex_only` did not work end to end. 1.1.0 shipped it verified structurally — the mode was
