@@ -1914,13 +1914,12 @@ function evaluateConvergence(n, claudeRound, codexParsed, codexInvalid, priorTim
   // about earlier broken rounds already sitting in seatRounds, and the reader trusted them.
   if (seatRounds.length) {
     const cur = !rolesUsable && (logicSeatP0 + runSeatP0) > 0
-    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit (prior_state.claude_roles missing / length disagrees with the verdict array / all empty) in round ${seatRounds.join('/')}${cur ? ` (including THIS round, ${logicSeatP0 + runSeatP0} P0(s))` : ' (carried forward to here)'}. The seat attribution of those rounds' P0(s) is NOT trustworthy - the sequencing check cannot be made for them, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
-  } else if (false) {
-    // Re-emitted, not carried: exactly the SEQUENCING shape. One line, naming the rounds, so a
-    // reader of the FINAL result still learns that some earlier round's seat attribution was
-    // untrustworthy. Excluding it from the carry without this branch removed the warning instead
-    // of de-duplicating it, which is the erasure this whole exercise is about.
-    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit in round ${seatRounds.join('/')} (carried forward to here): the seat attribution of that round's P0(s) is NOT trustworthy, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
+    // Integers only. seatRounds arrives from prior_state, which is not validated element-wise, and
+    // it is interpolated into a line a human reads -- an auditor measured `in round <script>//[object
+    // Object]` from a junk state. Pre-existing, but a message built from unvalidated input is exactly
+    // the shape this file distrusts everywhere else.
+    const seatShown = seatRounds.filter(x => Number.isInteger(x) && x > 0).join('/') || '(unreadable)'
+    advisories.push(`[ADVISORY] Seat identity was lost or misaligned in transit (prior_state.claude_roles missing / length disagrees with the verdict array / all empty) in round ${seatShown}${cur ? ` (including THIS round, ${logicSeatP0 + runSeatP0} P0(s))` : ' (carried forward to here)'}. The seat attribution of those rounds' P0(s) is NOT trustworthy - the sequencing check cannot be made for them, which is not the same as "there is no sequencing problem". Read them yourself to tell method-level from line-level.`)
   }
   // findings: the P0s THEMSELVES. carry is findings PLUS directives written for the next round's
   // prompt, and those embed round-varying text (a count of approving verdicts, the auditor's own
@@ -1944,6 +1943,10 @@ let resultBase = {
   task: TASK, project: PROJECT || null, kind: KIND, risk: RISK, mode: MODE,
   rounds_allowed: roundsAllowed, codex_mode: CODEX_MODE, task_fingerprint: TASK_FP, run_id: RUN_ID || null,
   findings_ledger: [],   // replaced once this round's gate has adjudicated the previous round
+  // Declared for the same reason as findings_ledger above: a pre-identity refusal must not relay
+  // a foreign state's advisories, but it should still hand back the KEY with an empty array
+  // rather than nothing at all. Overwritten with the real carry once identity is confirmed.
+  advisories: [],
 }
 
 // ---- fail-closed: refuse a prior_state that does not belong to THIS audit (cross-project guard) ----
