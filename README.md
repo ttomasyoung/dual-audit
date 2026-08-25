@@ -201,11 +201,12 @@ about style. A finding without one is not a finding, and the protocol says so to
 
 ## Reading the result
 
-There are exactly four terminal states, and only one of them means the review passed:
+There are exactly five terminal states, and only one of them means a full review passed:
 
 | State | Meaning |
 |---|---|
-| `CONVERGED` | Both gates passed. **The only state that may be described as a completed review.** |
+| `CONVERGED` | Both gates passed. **The only state that may be described as a completed dual review.** |
+| `CONVERGED_SINGLE_SEAT` | One seat read, and approved. Held to the same gates, but with one perspective instead of two, so it is **less than `CONVERGED` and must never be treated as equal to it**. Returned by `codex_only`. |
 | `NOT_CONVERGED` | The rounds ran out with substantive disagreement, or a claim needs human sign-off. Unresolved issues and minority positions come with it. |
 | `INFRASTRUCTURE_BLOCKED` | A reviewer or a runtime facility was unavailable. **Nothing was judged** — this is not "no problems found". |
 | `INVALID_AUDIT` | Identity, state, schema or argument validation failed. The audit is not trustworthy; fix the input and re-run. |
