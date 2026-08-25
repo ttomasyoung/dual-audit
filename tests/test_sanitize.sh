@@ -53,6 +53,18 @@ echo "=== The scanner does NOT misfire ==="
 plant g.md 'A perfectly ordinary English sentence about review protocols.' && ok "a clean file passes" || bad "a clean file was rejected"
 plant h.md 'This line mentions /home/user/ deliberately. sanitize-scan:allow' && ok "an explicitly marked line is exempt" || bad "the exemption marker does not work"
 
+echo "=== A marked date does not exempt the file it lives in ==="
+# scripts/analyze_runs.py carries freeze-date constants and is marked line by line, because a
+# script that measures a window cannot exist without naming it. The marker is a WHOLE-LINE escape,
+# so the case that decides whether this is still a gate is the next dated line somebody adds to
+# that same file without one. A relaxation without its own bad case is how a gate quietly stops
+# being one.
+#
+# Both cases are one line each on purpose: the marker exempts the line it sits on, so a backslash
+# continuation would leave the date on an unmarked line. That is how this test first failed.
+plant analyze_runs.py "MAIN_CUT = '2026-07-28'   # sanitize-scan:allow (freeze-date constant)" && ok "a marked freeze-date constant is allowed" || bad "the marked freeze-date constant is refused"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
+plant analyze_runs.py '# we shipped the fix on 2026-07-24 after the third review round' && bad "an UNMARKED dated line in that same file was NOT caught" || ok "an unmarked dated line in that same file is still caught"   # sanitize-scan:allow (the fixture must contain the forbidden pattern)
+
 echo "=== History is content too, not just an author line ==="
 # One identity for all three throwaway fixture repositories. It lives in a variable because the
 # lines that use it are continuations, and the exemption marker has to sit at the end of a line.
