@@ -162,6 +162,10 @@ Workflow({
 })
 ```
 
+Add `codex_timeout_s: <seconds>` when one review needs more than the tool's default nine minutes in a
+single piece; it requires `BASH_MAX_TIMEOUT_MS` in the Claude settings env and is refused loudly when
+that cap was not raised. See "The long seat" in [docs/configuration.md](docs/configuration.md).
+
 `task` and `context` must be self-contained — the reviewers do not share the controller's context.
 For anything involving code, `contextPack` is required (targets, expected outputs, canonical
 docs), and every path in it must be absolute. See [docs/configuration.md](docs/configuration.md).
@@ -331,18 +335,20 @@ The two reviewers were used on this repository throughout its own development, a
 earned their place in it.
 
 **Codex** reviewed as the independent side. Working from the raw sources and without seeing the
-other side's conclusions, it found things the author's own tooling was structurally blind to —
+other side's conclusions, it found things the controller side was structurally blind to —
 including a private identifier surviving in git history that the repository's own pre-publication
 scanner did not look for, a hole in the verdict grammar that let a stated blocker travel through the
 whole panel unread, and a delete path deriving its file list twice while comparing only the lengths.
-On several of those the author's side had argued the opposite and was wrong.
+On several of those the controller side had argued the opposite and was wrong.
 
-**Claude** was the controller and the author's side of every panel, and wrote the code.
+**Claude Code** ran as the controller: it drove each panel, dispatched the seats, and threaded the
+state between rounds.
 
-Codex is deliberately not listed as a co-author of the commits. Attribution in git means "helped
-write this", and its role here was to review — which in a project built on the premise that the
-author and the verifier must not collapse into one is a distinction worth keeping visible rather
-than flattening into a contributor count.
+Neither model is listed as a co-author of the commits. Attribution in git means "helped write
+this", and both were used here as tools — one to drive the panel, one to review it. In a project
+built on the premise that the author and the verifier must not collapse into one, the distinction
+between the tools that ran and the person answerable for the result is worth keeping visible
+rather than flattening into a contributor count.
 
 ## Licence
 

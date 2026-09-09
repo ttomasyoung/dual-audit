@@ -24,6 +24,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENTDEF="${DUAL_AUDIT_AGENTDEF:-$HERE/../runtime/codex-auditor/dual-audit-codex-readonly.md}"
 WRAPPER="${DUAL_AUDIT_WRAPPER:-$HERE/../runtime/codex-auditor/dual-audit-codex}"
+# The driver is the other half of the seat-params protocol (long seat): the definition tells the seat
+# what the line means, the driver writes it. The two are checked against each other below.
+DRIVER="${DUAL_AUDIT_DRIVER:-$HERE/../runtime/claude-controller/dual-audit-run.js}"
+SEAT_TOKEN_LITERAL="dual-audit:seat-params"   # the protocol token; used only to catch a driver that emits it undeclared
 # 🔴 The caller's real limits live HERE, not in the document being graded. Second review finding:
 #    conditions (1) and (3) read tool_default_ms and tool_max_ms out of the very file under test, so
 #    they compared the document to itself. A marker saying `tool_max_ms=9999999 tool_default_ms=1`
@@ -35,9 +39,9 @@ D="$(mktemp -d "${TMPDIR:-/tmp}/dual-audit-agentdef.XXXXXX")" || exit 2
 trap 'rm -rf "$D"' EXIT
 pass=0; fail=0
 
-# check_contract <agentdef> <wrapper> -> 0 ok, 1 refused (reason on stderr)
+# check_contract <agentdef> <wrapper> [driver] -> 0 ok, 1 refused (reason on stderr)
 check_contract() {
-  local ad="$1" wr="$2" line req dflt max to ka budget
+  local ad="$1" wr="$2" drv="${3:-$DRIVER}" line req dflt max to ka budget tok
   line="$(grep -o 'dual-audit:bash-timeout-contract[^>]*' "$ad" | head -1)"
   [ -n "$line" ] || { echo "no bash-timeout-contract marker in $ad" >&2; return 1; }
   req="$(printf '%s' "$line"  | sed -n 's/.*required_ms=\([0-9]\+\).*/\1/p')"
@@ -64,6 +68,32 @@ check_contract() {
   [ "$TOOL_DEFAULT_MS" -lt "$budget" ] || { echo "the tool default ${TOOL_DEFAULT_MS}ms already covers the wrapper's ${budget}ms — the stated requirement is obsolete, not merely unnecessary" >&2; return 1; }
   # (4) The prose a human reads and the contract a machine reads must agree on the number.
   grep -q "timeout: $req" "$ad" || { echo "the prose does not show the copy-pasteable form 'timeout: $req'" >&2; return 1; }
+  # (5) The long seat, checked in BOTH directions across the two files that implement it. If the marker
+  #     declares a seat-params token, the prose must instruct it (the token must occur on a line other
+  #     than the marker) AND the driver must emit exactly that token as a string literal. If the marker
+  #     declares none, the driver must not emit one either — a seat handed a line it was never told
+  #     about would paste it into the brief and run on the default budget while the caller believes it
+  #     asked for more. A token renamed on one side alone goes red here, whichever side moved.
+  tok="$(printf '%s' "$line" | sed -n 's/.*seat_params_token=\([^ >]*\).*/\1/p')"
+  [ -f "$drv" ] || { echo "cannot cross-check the seat-params protocol: driver $drv is missing" >&2; return 1; }
+  if [ -n "$tok" ]; then
+    [ "$(grep -c -F -- "$tok" "$ad")" -ge 2 ] || { echo "the marker declares seat_params_token=$tok but the prose never instructs it" >&2; return 1; }
+    grep -q -F -- "'$tok'" "$drv" || { echo "the definition expects seat-params token '$tok' but the driver $drv does not emit it" >&2; return 1; }
+  elif grep -q -F -- "$SEAT_TOKEN_LITERAL" "$drv"; then
+    echo "the driver emits a seat-params line but the definition declares no seat_params_token — the seat would never be told what that line means" >&2; return 1
+  fi
+  # (6) The driver's idea of the default seat must be the wrapper's real default, and the smallest long-seat
+  #     request must exceed it. The applied check is `launched > DEFAULT_SEAT_S`: if the wrapper's default ever
+  #     moves and this constant does not, a default-lane seat announcing the new default reads as an applied
+  #     long seat. A review found the original window (requests of 541..600 read a 540 fall-back as applied).
+  if [ -n "$tok" ]; then
+    local dseat lmin
+    dseat="$(grep -oP '^const DEFAULT_SEAT_S = \K[0-9]+' "$drv" | head -1)"
+    lmin="$(grep -oP '^const LANE_MIN_S = \K[0-9]+' "$drv" | head -1)"
+    [ -n "$dseat" ] && [ -n "$lmin" ] || { echo "the driver $drv does not declare DEFAULT_SEAT_S / LANE_MIN_S" >&2; return 1; }
+    [ "$dseat" = "$to" ] || { echo "the driver's DEFAULT_SEAT_S=$dseat is not the wrapper's TIMEOUT default $to — an ignored seat-params line would no longer be told from an applied one" >&2; return 1; }
+    [ "$lmin" -gt "$dseat" ] || { echo "the driver's LANE_MIN_S=$lmin does not exceed the default seat $dseat — the smallest accepted request could not be told from an ignored line" >&2; return 1; }
+  fi
   return 0
 }
 
@@ -147,6 +177,54 @@ elif check_contract "$AGENTDEF" "$D/fast-wrapper" 2>/dev/null; then
   fail=$((fail+1)); echo "  FAIL a wrapper that now fits inside the tool default still passes — the instruction is obsolete and nothing says so"
 else
   pass=$((pass+1)); echo "  PASS a wrapper that fits inside the tool default makes the standing requirement report as obsolete"
+fi
+
+echo "=== The long seat is a two-file protocol: each side must match the other ==="
+# 5a: the marker declares the token but the prose no longer instructs it (every non-marker mention removed).
+grep -v '^[^<].*dual-audit:seat-params\|^```' "$AGENTDEF" | grep -v '^<!-- dual-audit:seat-params' > "$D/noprose.md"
+if [ "$(grep -c -F -- "dual-audit:seat-params" "$D/noprose.md")" -ne 1 ]; then
+  fail=$((fail+1)); echo "  FAIL the 5a fixture did not isolate the marker (expected exactly one remaining mention)"
+elif check_contract "$D/noprose.md" "$WRAPPER" 2>/dev/null; then
+  fail=$((fail+1)); echo "  FAIL a definition whose marker declares the token while the prose never instructs it passes"
+else
+  pass=$((pass+1)); echo "  PASS a declared token that the prose never instructs is refused"
+fi
+# 5b: the definition is intact but the driver no longer emits the token.
+sed "s/'dual-audit:seat-params'/'dual-audit:seat-params-RENAMED'/" "$DRIVER" > "$D/driver-renamed.js"
+if ! grep -q -F -- "seat-params-RENAMED" "$D/driver-renamed.js"; then
+  fail=$((fail+1)); echo "  FAIL the 5b fixture did not rename the token in the driver — this case proves nothing"
+elif check_contract "$AGENTDEF" "$WRAPPER" "$D/driver-renamed.js" 2>/dev/null; then
+  fail=$((fail+1)); echo "  FAIL a driver that emits a different token than the definition declares passes"
+else
+  pass=$((pass+1)); echo "  PASS a driver whose token no longer matches the definition is refused"
+fi
+# 5c: the marker declares no token while the driver still emits one.
+sed 's/ seat_params_token=[^ >]*//' "$AGENTDEF" > "$D/undeclared.md"
+if grep -q 'seat_params_token=' "$D/undeclared.md"; then
+  fail=$((fail+1)); echo "  FAIL the 5c fixture did not remove the declaration"
+elif check_contract "$D/undeclared.md" "$WRAPPER" 2>/dev/null; then
+  fail=$((fail+1)); echo "  FAIL a driver emitting an UNDECLARED seat-params line passes — the seat was never told what it means"
+else
+  pass=$((pass+1)); echo "  PASS a driver emitting a seat-params line the definition never declared is refused"
+fi
+
+# 6a: the driver's default-seat constant drifts from the wrapper's real default.
+sed 's/^const DEFAULT_SEAT_S = [0-9]*/const DEFAULT_SEAT_S = 541/' "$DRIVER" > "$D/driver-drift.js"
+if ! grep -q '^const DEFAULT_SEAT_S = 541' "$D/driver-drift.js"; then
+  fail=$((fail+1)); echo "  FAIL the 6a fixture did not change DEFAULT_SEAT_S — this case proves nothing"
+elif check_contract "$AGENTDEF" "$WRAPPER" "$D/driver-drift.js" 2>/dev/null; then
+  fail=$((fail+1)); echo "  FAIL a driver whose DEFAULT_SEAT_S is not the wrapper's default passes"
+else
+  pass=$((pass+1)); echo "  PASS a driver default-seat constant that drifted from the wrapper's default is refused"
+fi
+# 6b: the smallest accepted request equals the default seat.
+sed 's/^const LANE_MIN_S = [0-9]*/const LANE_MIN_S = 540/' "$DRIVER" > "$D/driver-lowmin.js"
+if ! grep -q '^const LANE_MIN_S = 540' "$D/driver-lowmin.js"; then
+  fail=$((fail+1)); echo "  FAIL the 6b fixture did not lower LANE_MIN_S — this case proves nothing"
+elif check_contract "$AGENTDEF" "$WRAPPER" "$D/driver-lowmin.js" 2>/dev/null; then
+  fail=$((fail+1)); echo "  FAIL a driver accepting a request no longer than the default seat passes"
+else
+  pass=$((pass+1)); echo "  PASS a driver whose smallest request does not exceed the default seat is refused"
 fi
 
 echo "=== A missing contract marker is refused ==="

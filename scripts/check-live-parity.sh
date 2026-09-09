@@ -153,7 +153,10 @@ run() { # run <label> <command...>
   else fail=1; echo "  FAIL $label  ${line:-rc=$rc}"; printf '%s\n' "$out" | grep -E '^\s+(FAIL|✗)' | head -5; fi
 }
 run "panel"   env DUAL_AUDIT_PANEL="$LIVE_PANEL" node "$REPO/tests/test_panel.mjs"
-run "driver"  env DUAL_AUDIT_DRIVER="$LIVE_DRIVER" DUAL_AUDIT_RC_MARKER="__$LIVE_RC" node "$REPO/tests/test_driver.mjs"
+# The seat attempt ledger lives in the PROMPT, so only a suite that reads what the deployed panel
+# actually emits can tell whether it is still there. Same reason the panel suite runs against live.
+run "attempt ledger" env DUAL_AUDIT_PANEL="$LIVE_PANEL" node "$REPO/tests/test_seat_attempt_ledger.mjs"
+run "driver"  env DUAL_AUDIT_DRIVER="$LIVE_DRIVER" DUAL_AUDIT_RC_MARKER="__$LIVE_RC" DUAL_AUDIT_ENVP="$LIVE_ENVP" node "$REPO/tests/test_driver.mjs"
 # The argument-size gate is checked against the deployed driver too. It was added to both
 # builds in one sitting, which is exactly when a gate is easiest to leave on only one side.
 run "args size" env DRIVER="$LIVE_DRIVER" node "$REPO/tests/test_args_size_gate.mjs"
@@ -161,7 +164,7 @@ run "wrapper" env DUAL_AUDIT_WRAPPER="$LIVE_WRAPPER" DUAL_AUDIT_ENVP="$LIVE_ENVP
 # The two definitions are written for different audiences and deliberately differ in wording, so this
 # does NOT diff them. It runs the contract gate against the deployed pair, which is the part that has
 # to hold on both sides regardless of prose.
-run "agentdef" env DUAL_AUDIT_AGENTDEF="$LIVE_AGENTDEF" DUAL_AUDIT_WRAPPER="$LIVE_WRAPPER" bash "$REPO/tests/test_agentdef.sh"
+run "agentdef" env DUAL_AUDIT_AGENTDEF="$LIVE_AGENTDEF" DUAL_AUDIT_WRAPPER="$LIVE_WRAPPER" DUAL_AUDIT_DRIVER="$LIVE_DRIVER" bash "$REPO/tests/test_agentdef.sh"
 
 echo ""
 if [ "$fail" = 0 ]; then echo "=== PARITY OK ==="; else echo "=== PARITY FAILED — the two builds have diverged ==="; fi

@@ -133,6 +133,31 @@ function taskFingerprint(project, task, ctx) {
 // forbids Date.now()/Math.random(), so the panel cannot mint a nonce — the caller supplies one and threads it
 // back unchanged every round.
 const RUN_ID = (input.run_id == null ? '' : String(input.run_id)).trim()
+// RUN_SLUG: RUN_ID is CALLER-SUPPLIED and gets interpolated into a shell command inside the seat
+// prompt, so it is reduced to a conservative path-safe alphabet BEFORE it can reach one. An id
+// carrying `;`, `$(` or `..` would otherwise be a command-injection / path-traversal route into every
+// seat that runs Bash. Leading dot/dash are stripped too (hidden dir, or a path read as a flag).
+// An EMPTY slug DISABLES the attempt ledger rather than falling back to a shared fixed path: a fixed
+// path is precisely the cross-audit contamination the mktemp rule downstream exists to prevent.
+// FNV-1a. The workflow runtime has no crypto and no require(), and Date.now()/Math.random() throw,
+// so the hash must be pure and deterministic — which is also what makes it safe to recompute every round.
+const _fnv1a = (str) => {
+  let h = 0x811c9dc5
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0 }
+  return h.toString(36)
+}
+// The sanitiser is LOSSY, so it must not be the whole slug: `a/b` and `a?b` both reduce to `a_b`, and
+// two different audits would then share one ledger file — the second seat reads the first audit's
+// count and is handed a foreign sandbox as "your predecessor's". Appending a hash of the ORIGINAL
+// restores injectivity: distinct run_ids cannot collide, identical ones still map to one path.
+const _slugBody = RUN_ID.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[._-]+/, '').slice(0, 48)
+// 🔴 ALWAYS suffix. The earlier version appended the hash only when sanitising CHANGED something,
+// and that branch asymmetry is itself a collision route: `proj/alpha` sanitises to `proj_alpha` and
+// becomes `proj_alpha-dda7hp`, while the literal id `proj_alpha-dda7hp` is already legal, takes the
+// unsuffixed branch, and lands on the SAME slug (counter-example supplied by the review panel; my own
+// 410-sample sweep missed it because it never fed an id that equals another id's COMPUTED slug).
+// With the suffix unconditional, two distinct ids can only collide if FNV-1a itself collides.
+const RUN_SLUG = !RUN_ID ? '' : ((_slugBody || 'run') + '-' + _fnv1a(RUN_ID))
 // CTX_SIG binds EVERY caller-supplied arg except the per-round handshake payload. Enumerating a hand-picked
 // subset was repeatedly fail-OPEN: `context`, `kind`, `risk`, `mode`, `codex_mode` all reshape the brief, the
 // lens set, the mandatory sentinel fields and the convergence gates, yet none were bound — two substantively
@@ -346,7 +371,26 @@ const codeRelevant = (KIND === 'code' || KIND === 'mixed')
 // side per invocation, emits the per-round Codex brief, and hands off; the main loop runs codex and
 // re-invokes with the codex verdict. 'forward' keeps the old in-workflow forwarder as an explicit
 // experimental opt-in only. See memory reference_dual_audit_panel.
-const CODEX_MODE = (norm(input.codex_mode, 'deferred') === 'forward') ? 'forward' : 'deferred'
+// codex_mode is a WHITELIST, exactly like KIND_VALID above — an unrecognised value is refused, never
+// silently downgraded. The first version of this guard refused only the exact token 'forward' and left
+// every near-miss falling through to the default: measured, 'forwrad' / 'fwd' / 'forwards' each ran an
+// ordinary deferred round and reported codex_mode 'deferred' with no error. That is the SAME
+// silent-downgrade shape the guard was written to close — a typo'd opt-in still got the outcome the
+// caller did not ask for. Both review seats found this independently; the probe reproduced it.
+const CODEX_MODE_VALID = ['deferred']
+const CODEX_MODE_RAW = norm(input.codex_mode, 'deferred')
+if (!CODEX_MODE_VALID.includes(CODEX_MODE_RAW)) {
+  return { converged: false, terminal_state: 'INVALID_AUDIT', rc_diagnostics: [],
+    error: `codex_mode '${CODEX_MODE_RAW}' is not recognised. Valid: ${CODEX_MODE_VALID.join(' | ')} (or omit it). `
+      + (CODEX_MODE_RAW === 'forward'
+        ? "'forward' is ORPHANED on this build and is refused rather than silently downgraded: "
+          + "budgetedAgent's codex branch is reachable only via kind:'codex' and the sole dispatch site "
+          + "hardcodes kind:'claude', so requesting it would have run the ordinary DEFERRED main-loop pass "
+          + "while reporting forward mode. Restore the dispatch site before re-enabling it."
+        : "Refused rather than defaulted, because a value the panel does not understand most often means "
+          + "the caller wanted something it is not getting, and a silent fallback hides exactly that.") }
+}
+const CODEX_MODE = 'deferred'
 
 if (!TASK) return { converged: false, error: 'dual-audit-panel needs a non-empty task. Pass a string or {task, context, project, risk, kind, mode, contextPack}.' }
 
@@ -629,9 +673,33 @@ const cumulativeRaw = prior ? prior.cumulative_used : undefined
 const cumulativeValid = !prior ? true :
   (typeof cumulativeRaw === 'number' && Number.isInteger(cumulativeRaw) && cumulativeRaw >= 0 && cumulativeRaw <= HARD_TOTAL_CEILING)
 const cumulativeUsed = (prior && cumulativeValid) ? cumulativeRaw : 0
+// Seat retries must accumulate ACROSS panel invocations for the same reason the agent budget does:
+// the panel runs one round per call, so a retry seen in round 1 is gone by the time the driver reads
+// the terminal result, and the caller concludes nothing was discarded. Unlike cumulative_used this is
+// telemetry and gates nothing, so a malformed value degrades to 0 instead of aborting the audit.
+const priorSeatRetriesRaw = prior ? prior.seat_retries_cumulative : undefined
+const priorSeatRetries = (typeof priorSeatRetriesRaw === 'number' && Number.isInteger(priorSeatRetriesRaw)
+  && priorSeatRetriesRaw >= 0 && priorSeatRetriesRaw <= 1000) ? priorSeatRetriesRaw : 0
 
 // ---- Budget ledger (fail-closed; seeded with cumulative use across invocations) ----
-const ledger = { claudeUsed: 0, codexUsed: 0, totalUsed: cumulativeUsed, skippedOverBudget: 0, invalid: 0, codexBlocked: false, codexSkipped: 0, codexDeferred: 0, rounds: [] }
+const ledger = { claudeUsed: 0, codexUsed: 0, totalUsed: cumulativeUsed, skippedOverBudget: 0, invalid: 0, codexBlocked: false, codexSkipped: 0, codexDeferred: 0, seatRetries: priorSeatRetries, rounds: [] }
+// 🔴 ONE constructor, not N literals. Every `agent_budget` in this file goes through here.
+// Why it is a function: `seat_retries` was added to 8 of 11 literals and missed 3; the scope
+// qualifier was then added to exactly 1, and that one turned out to be the internal handoff return
+// the driver never hands back — so the qualifier reached nobody while every terminal emitted a bare
+// count. Twice the same shape. A literal repeated 11 times will drift again; a call site cannot.
+// The scope string is NOT decoration: a bare 0 here would otherwise be read as "no work was lost",
+// and two distinct blind spots make that reading wrong.
+const SEAT_RETRIES_SCOPE = 'claude_seats_only; a 0 is NOT evidence that nothing was discarded. '
+  + 'Blind spot 1: the codex side runs --sandbox read-only and cannot write a ledger entry at all. '
+  + 'Blind spot 2: a seat killed AFTER it recorded completion but BEFORE its verdict reached the '
+  + 'panel leaves a balanced ledger, so its loss is invisible here too.'
+function agentBudget(extra) {
+  return Object.assign({
+    total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed,
+    seat_retries: ledger.seatRetries, seat_retries_scope: SEAT_RETRIES_SCOPE,
+  }, extra || {})
+}
 function canLaunch(kind, rc, rx) {
   if (ledger.totalUsed >= HARD_TOTAL_CEILING) return false
   if (kind === 'claude' && rc >= MAX_CLAUDE_PER_ROUND) return false
@@ -838,7 +906,7 @@ function parseSentinel(text) {
   // The reserved field names are OUR OWN vocabulary - finite, defined by us - which is a different
   // problem from "enumerate every colon-like or newline-like character in Unicode". That one has no
   const FIELD_NAMES = ['VERDICT', 'P0', 'P1', 'VERIFIED', 'EVIDENCE', 'RECOMMEND', 'DELTA',
-    'ANCHOR', 'LIT_CONFLICTS', 'UNANCHORED_CLAIMS', 'AUDIT-ID']
+    'ANCHOR', 'LIT_CONFLICTS', 'UNANCHORED_CLAIMS', 'AUDIT-ID', 'ATTEMPT']
   const NAME_ALT = FIELD_NAMES.join('|')
   // A value may not contain "reserved field name + colon". That one rule covers both
   //   `EVIDENCE: x<br>P0: real blocker` (Markdown renders it as two lines) and `- P0: real blocker`
@@ -1261,6 +1329,11 @@ function parseSentinel(text) {
   // Read the remaining fields BEFORE deciding validity, so their duplicates land in fieldDup too.
   const p1List = listVal('P1') || []
   const recommendVal = lineVal('RECOMMEND') || ''
+  // ATTEMPT: the seat's own retry counter (see attemptLedgerNote). DELIBERATELY not a validity field:
+  // a change whose whole purpose is to make discarded work visible must never be able to invalidate an
+  // otherwise legitimate verdict. Absent or unparseable => 1, the normal case — never an error.
+  const attemptRaw = (lineVal('ATTEMPT') || '').trim()
+  const attemptNum = /^[0-9]{1,4}$/.test(attemptRaw) ? parseInt(attemptRaw, 10) : 1
   // AUDIT-ID used to be read ONLY by two dedicated scanners and never through lineVal, so a
   // conflicting duplicate could never reach fieldDup: "the correct id plus a foreign id smuggled in
   // behind a numbered prefix" stayed valid and converged. A `- ` or `* ` prefix happened to be caught
@@ -1269,7 +1342,7 @@ function parseSentinel(text) {
   lineVal('AUDIT-ID')   // registers conflicting duplicates: two DIFFERENT ids in one block invalidate it, same rule as every other field
   const valid = validBase && fieldDup.length === 0
   const approvesFinal = valid && (verdict === 'APPROVE' || verdict === 'APPROVE_WITH_CHANGES') && p0.length === 0
-  return { valid, placeholder, verdict, p0, p0_demoted: p0Demoted, p1: p1List, anchor, litConflicts: litList, unanchored: unanchoredList || [], verified, evidence: evidenceVal || '', recommend: recommendVal, delta, approves: approvesFinal, duplicated_fields: fieldDup.slice(),
+  return { valid, placeholder, verdict, p0, p0_demoted: p0Demoted, attempt: attemptNum, p1: p1List, anchor, litConflicts: litList, unanchored: unanchoredList || [], verified, evidence: evidenceVal || '', recommend: recommendVal, delta, approves: approvesFinal, duplicated_fields: fieldDup.slice(),
     ambiguous_block_count: ambiguousBlockCount,
     format_warnings: (blockShape ? blockShape.warnings.slice() : []).concat(hidesGatingWarn)
       .concat(fieldMerged.map(n => 'field ' + n + ' appeared more than once with different values - collapsed into ONE value. Exactly what happens: if every occurrence is a non-answer ("none"/"n/a"/empty) the FIRST one is kept verbatim (they are never concatenated, which would launder two non-answers into something that reads as content); otherwise the contentful occurrences are joined with "; " and duplicate/empty entries are dropped. A "none"/empty occurrence sitting alongside a contentful one is NOT merged at all - it is treated as a contradiction and invalidates the block. NOTE this field MAY still gate the round: EVIDENCE gates validity and the digit requirement, UNANCHORED_CLAIMS gates the anchor check.')),
@@ -1319,7 +1392,7 @@ function sentinelContract(crossExamine, auditId) {
     'Padding P0 does not make your review look thorough; it makes the panel run another round for no reason.',
     '"P0: none" is a complete, valid, and frequently correct answer.',
     'Fields that decide whether your verdict is VALID: VERDICT, P0, EVIDENCE' + (codeRelevant ? ', VERIFIED' : '') + (claimMode ? ', ANCHOR, UNANCHORED_CLAIMS' : '') + '.',
-    'P1 / LIT_CONFLICTS / RECOMMEND are expected but their absence does NOT invalidate your verdict.',
+    'P1 / LIT_CONFLICTS / RECOMMEND / ATTEMPT are expected but their absence does NOT invalidate your verdict.',
     'The final line of your entire reply MUST be exactly: END. Nothing after it - no closing remark, no code fence.',
     'A reply without that line is discarded WHOLE (fail-closed): every finding in it is lost and the round cannot converge.',
     'Write your prose first if you want, then the block below, then END.',
@@ -1392,10 +1465,18 @@ function b64utf8(str) {
 // ~/bin/codex-audit wrapper (stdin -> private CODEX_HOME + slot + early snapshot). A FIXED path like the
 // old /tmp/dual-audit/task_<tag>.txt is SHARED across sessions and gets overwritten -> cross-session
 // contamination; tag is kept only for the call signature/labeling.
+// 🔴 This legacy forward path shipped WITHOUT `--emit-rc` and without telling the runner to pass the
+// Bash tool's `timeout`. Both are load-bearing and both were missing, so the path could not deliver the
+// loud-failure contract it is supposed to have: no RC marker means rcInsideVerdictBlock finds nothing and
+// the driver reports "codex unavailable", while the tool's 120s default kills a review that needs several
+// minutes and returns an EMPTY stdout — which is byte-identical to "the reviewer found nothing to say".
+// Fail-closed either way, so nothing was ever waved through, but the seat is lost and the reason is
+// misattributed. Dormant in practice (CODEX_MODE defaults to 'deferred'; only codex_mode:'forward'
+// reaches here), which is exactly why it went unnoticed. Found by an independent codex read, verified here.
 function codexRoForward(task, tag) {
   const b64 = b64utf8(task)
-  const sh = "set -e\nD=$(mktemp -d /tmp/codex_ro.XXXXXX)\ntrap 'rm -rf \"$D\"' EXIT\nprintf '%s' '" + b64 + "' | base64 -d > \"$D/brief.md\"\n~/bin/codex-audit exec --sandbox read-only --skip-git-repo-check - < \"$D/brief.md\""
-  return 'You are a non-reasoning command runner. Use the Bash tool to execute the following shell script EXACTLY as written (do not modify it, do not add/remove flags, do not explain). Then return ONLY the script\'s stdout, verbatim, with no preface or commentary:\n\n```bash\n' + sh + '\n```'
+  const sh = "set -e\nD=$(mktemp -d /tmp/codex_ro.XXXXXX)\ntrap 'rm -rf \"$D\"' EXIT\nprintf '%s' '" + b64 + "' | base64 -d > \"$D/brief.md\"\n~/bin/codex-audit exec --sandbox read-only --skip-git-repo-check --emit-rc - < \"$D/brief.md\""
+  return 'You are a non-reasoning command runner. Use the Bash tool to execute the following shell script EXACTLY as written (do not modify it, do not add/remove flags, do not explain). Then return ONLY the script\'s stdout, verbatim, with no preface or commentary.\n\n🔴 You MUST pass `timeout: 580000` on that Bash call. The tool default is 120000 ms (two minutes); a review takes several, so a call made without it is killed with an empty stdout — indistinguishable from a reviewer that found nothing. 580000 sits just inside the tool maximum of 600000 and just outside the wrapper\'s own 540+30s, so the wrapper always times out FIRST and returns a loud __CODEX_RC=124 instead of being silently cut off.\n\n```bash\n' + sh + '\n```'
 }
 
 // kind: 'claude' | 'codex'(=read-only via forwarder, forward mode only) ; returns {kind, role, parsed, invalid|skipped|deferred}
@@ -1442,6 +1523,12 @@ async function budgetedAgent(kind, role, prompt, rs) {
   catch (e) { ledger.invalid++; return { kind, role, invalid: true, invalidReason: 'agent_threw', parsed: parseSentinel('') } }
   if (raw == null) { ledger.invalid++; return { kind, role, invalid: true, invalidReason: 'null_result', parsed: parseSentinel('') } }
   const parsed = parseSentinel(raw)
+  // A retry is NOT a defect in the audited work and does NOT block convergence — it is a fact about
+  // THIS PANEL RUN that would otherwise leave no trace anywhere in the output.
+  if (parsed && parsed.attempt > 1) {
+    ledger.seatRetries += (parsed.attempt - 1)
+    log(`SEAT RETRY ${kind}/${role} r${rs.n}: seat reports ATTEMPT ${parsed.attempt} - ${parsed.attempt - 1} earlier seat(s) with this exact assignment started and never recorded completion; their work was discarded. Sandbox pointers (if any): /tmp/dual-audit/.attempts/${RUN_SLUG}/. Claude seats only: the read-only codex side cannot write a ledger entry.`)
+  }
   if (!parsed.valid) {
     ledger.invalid++
     if (kind === 'codex' && !ledger.codexBlocked && /auto mode classifier|could not evaluate this action|denied by the Claude Code/i.test(String(raw))) {
@@ -1500,10 +1587,86 @@ const RUN_SEAT_ROLE = RUN_LENSES.join('')            // 'D1D2'
 // (a project-specific threshold, say) is injected ONLY via the profile's `rules` when the caller names that project — never baked
 // into the generic lens text, so the panel does not steer one project's audit toward another project's shape.
 
+// ---- seat attempt ledger ---------------------------------------------------------------------
+// PROBLEM (observed on a live run, not hypothetical): a seat that is interrupted mid-run and then
+// silently re-spawned by the RUNTIME is invisible here. agent() returns the REPLACEMENT's text, so
+// budgetedAgent sees one ordinary result and ledger.invalid stays 0 — a D1D2 seat that had run 17
+// minutes / 65 tool calls and produced evidence no other seat produced was reported as a clean round.
+// The runtime DOES record it (journal.jsonl: two `started`, one `result`, same key), but neither the
+// panel nor the driver can read a file — workflow scripts have no filesystem access at all. The only
+// component in the whole chain that can leave a mark is therefore the SEAT, which is why this is a
+// prompt instruction and not code.
+// Keyed on RUN_SLUG, NEVER on the tag alone: the tag is deterministic and repeats across audits
+// (58 sandboxes sharing one tag were measured under /tmp/dual-audit on one machine).
+// 🔴 SCOPE, and it is a structural limit rather than an omission: this covers CLAUDE seats only. The
+// codex side runs `codex exec --sandbox read-only` and CANNOT WRITE ANYWHERE, /tmp included, so it can
+// leave no mark by construction. A discarded codex pass therefore remains invisible here. That is why
+// the reported count carries `seat_retries_scope`: a bare 0 must not be read as "nothing was lost".
+// 🔴 COUNT UNFINISHED STARTS, NOT STARTS. The first version counted one line per seat launch, which
+// cannot distinguish "killed mid-run" from "ran and returned normally" — they leave the identical
+// mark. Two consequences, both reproduced by the review panel:
+//   * panel_cap_guard mandates the SAME `episode` for every launch of one problem (up to 3), the
+//     driver derives run_id from episode, and /tmp keeps these files for ~30 days, so launches 2 and 3
+//     of any audit saw PRIOR>=1 and fabricated retries that never happened (measured 0 -> 1 -> 2 with
+//     nothing interrupted);
+//   * a seat that treated the file as a scratchpad wrote prose into it, and `^attempt` matched lines
+//     like "attempts to reproduce ..." (observed live).
+// Fix: a START line and a DONE line, paired. PRIOR = starts - dones, which is exactly the invariant
+// the runtime's own journal.jsonl uses (a `started` with no `result`). Markers are deliberately
+// unmistakable so no prose can forge one, and old `attempt ...` lines match neither, so existing
+// directories migrate to PRIOR=0 by construction rather than by a cleanup step.
+// ⚠️ HONEST LIMIT, do not paper over it: this depends on the seat actually appending DONE last. A seat
+// that finishes but omits DONE makes the NEXT launch report a retry that did not happen. That is a
+// false POSITIVE — it over-reports lost work rather than hiding it — which is the survivable
+// direction, but it is not zero, and no amount of prompt wording makes it zero.
+function attemptLedgerNote(tag) {
+  if (!RUN_SLUG) return ''   // no partition key -> disabled, see RUN_SLUG
+  const dir = '/tmp/dual-audit/.attempts/' + RUN_SLUG
+  const f = dir + '/' + tag + '.log'
+  const S = '__DA_SEAT_START__', D = '__DA_SEAT_DONE__'
+  return [
+    'ATTEMPT LEDGER - two steps, and step 2 is not optional.',
+    'STEP 1, before any other tool call, exactly once:',
+    // ; not && : `grep -c` EXITS 1 WHEN IT COUNTS ZERO, which is the normal first-seat case, so an
+    // && chain aborts before the line is ever appended and the ledger stays permanently empty
+    // (measured: the chained form wrote nothing at all on a clean run). `touch` makes the count total.
+    // The command prints the number to REPORT, already incremented. Asking the seat to compute PRIOR+1
+    // itself was measured failing: both seats read PRIOR_ATTEMPTS=2 correctly and then wrote
+    // `ATTEMPT: 2` instead of 3, so the panel under-counted discarded seats by one per lane — an
+    // under-count is the "loss is invisible" direction, which is the one that matters here.
+    '  mkdir -p ' + dir + '; touch ' + f + '; PRIOR=$(( $(grep -c "^' + S + '" ' + f + ') - $(grep -c "^' + D + '" ' + f + ') )); [ "$PRIOR" -lt 0 ] && PRIOR=0; echo "' + S + ' ' + tag + '" >> ' + f + '; echo "PRIOR_ATTEMPTS=$PRIOR"; echo "REPORT_ATTEMPT=$((PRIOR+1))"',
+    // 🔴 BEFORE the verdict block, NOT after. The output contract in sentinelContract() states that the
+    // final line of the entire reply must be END with nothing after it, so "run this last, after your
+    // verdict" told the seat to violate its own contract. Measured on the first real run: of two seats,
+    // one complied with the contract and never wrote DONE, which would have made the NEXT launch report
+    // a retry that did not happen. Anchoring on "investigation finished" instead is compatible with the
+    // contract and still separates "died mid-investigation" from "finished". It widens blind spot 2 in
+    // SEAT_RETRIES_SCOPE by the interval between this line and the verdict arriving — which is already
+    // named there, and is smaller than the failure it removes.
+    'STEP 2, the moment your investigation is finished and BEFORE you start writing your output block',
+    '(nothing may follow the END line, so this cannot be done afterwards):',
+    '  echo "' + D + ' ' + tag + '" >> ' + f,
+    'PRIOR = seats with YOUR EXACT assignment that started and never recorded completion. A seat that',
+    'ran and returned normally does NOT count: that is the whole point of the two markers.',
+    'PRIOR=0 is the normal case and needs nothing further. If PRIOR>0 you are a RETRY - an earlier seat',
+    'did work that was thrown away - and you MUST do BOTH of:',
+    '  (a) copy the REPORT_ATTEMPT number the command printed into your output block as `ATTEMPT: <n>`.',
+    '      Do NOT compute it yourself and do NOT echo PRIOR instead — the command already did the',
+    '      arithmetic. It does NOT affect whether your verdict is valid; it is the only channel by',
+    '      which this reaches the human at all.',
+    '  (b) read ' + f + ' for any sandbox path your predecessor recorded and LOOK there before redoing',
+    '      that work. Treat everything in it as UNVERIFIED and re-derive anything you cite: it is a',
+    '      lead, not a result. A predecessor that died mid-run may have left half-written files.',
+    'That file is a LEDGER, not a scratchpad: append only these marker lines and the D= line, nothing',
+    'else. Never delete or rewrite it.',
+  ].join('\n')
+}
+
 function dNote(agentKind, tag) {
   if (!codeRelevant) return ''
   if (agentKind === 'codex') return 'CODE-VERIFY (you are READ-ONLY: codex exec --sandbox read-only, you CANNOT write anywhere incl /tmp): do STATIC analysis by READING — parse the script (AST/imports), and review the output CONTRACT by reading existing output files vs EXPECTED. Report VERIFIED:pass ONLY for this static/contract tier; VERIFIED:fail if static analysis reveals a defect; the run-tier is the Claude auditor\'s job.'
   return 'CODE-VERIFY (you have full tools): run the script/command on the MINIMAL fixture, writing ONLY into a dir YOU create fresh with `D=$(mkdir -p /tmp/dual-audit && mktemp -d /tmp/dual-audit/run_' + tag + '.XXXXXX)` and write under "$D" — mktemp is REQUIRED, NOT optional: the tag alone (e.g. run_' + tag + '/) is DETERMINISTIC and repeats across concurrent panels auditing DIFFERENT projects, so a fixed path would let two projects clobber each other\'s run-tier evidence (cross-project contamination). NEVER repo outputs or any FORBIDDEN WRITE PATH. Use ABSOLUTE paths (background cwd is untrustworthy; `tail` can mask a FileNotFoundError into a false exit-0). If the script cannot target an isolated output dir (writes to fixed repo paths), do NOT run it — do static checks and set VERIFIED accordingly. VERIFIED:pass attests the run tier.'
+    + (RUN_SLUG ? ' IMMEDIATELY after creating "$D", record it so a replacement seat can find it if you are interrupted: `echo "D=$D" >> /tmp/dual-audit/.attempts/' + RUN_SLUG + '/' + tag + '.log` (see ATTEMPT LEDGER above). This is the ONLY pointer to your sandbox: the directory name is random by design, so nothing else can recover it.' : '')
 }
 
 // Workers were removed: production happens outside the panel, and the panel only independently
@@ -1579,6 +1742,7 @@ function auditorPrompt(agentKind, n, openP0s, lensKeys, tag, shared) {
   ] : []
   return [
     HEADER,
+    attemptLedgerNote(tag),
     'You are an ADVERSARIAL AUDITOR (independent second opinion). Do NOT edit files. Read-only/dry-run verification only; never mutate repo state.',
     claimMode ? 'Two AIs agreeing is NOT proof. For biology demand EXTERNAL anchoring (canonical docs, literature, structure/data) and flag any claim resting only on AI inference. Published/prior conclusions are not automatically true — trace the evidence chain.' : '',
     'This work is one link in a long chain — verify before trusting; flag anything unverified that would propagate downstream.',
@@ -2011,7 +2175,7 @@ const shapeAbort = (statusName, why, fix) => ({
   // Also on the MALFORMED refusal: that terminal is precisely where the ledger cannot be
   // proven complete, and it was the one refusal that did not say so.
   ...(identityOk && (ledgerIncomplete || priorLedgerMalformed) ? { ledger_incomplete: true } : {}),
-  agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+  agent_budget: agentBudget(),
   recommended_next_action: fix,
 })
 if (priorPresent && !priorUsable) {
@@ -2236,7 +2400,7 @@ if (codexUnavailable) {
       needs_expert_signoff: false,
       blockers: [`codex produced no trustworthy verdict ${streak}x (${why}) for round ${priorRound} — cannot complete the independent dual-audit; do NOT treat the absence/kill as a pass. Surface to the user (codex may be down: timeout too tight / auth / sqlite lock / network).`],
       unresolved_p0: prior.open_p0s || [],
-      agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+      agent_budget: agentBudget(),
       recommended_next_action: 'Codex is repeatedly unavailable. Do NOT fabricate or infer its verdict and do NOT declare converged. Diagnose codex (raise the timeout your codex wrapper reads - that variable belongs to the WRAPPER, not to the panel, and the two deployments name it differently; check auth / logs_2.sqlite lock / network), then either re-run on the same brief or surface the unresolved issues to the user.',
     }
   }
@@ -2252,7 +2416,7 @@ if (codexUnavailable) {
       blockers: [`codex produced no trustworthy verdict (${why}) for round ${priorRound}, and prior_state.last_codex_brief is missing so the exact brief it should re-answer cannot be recovered.`],
       unresolved_p0: prior.open_p0s || [],
       demoted_p0: demotedLog,
-      agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+      agent_budget: agentBudget(),
       recommended_next_action: 'Restart this round from a clean state (re-invoke with the prior_state from the round BEFORE this one, or from round 1 if unavailable). Do NOT hand-rebuild the brief and do NOT hand-write the AUDIT-ID — a hand-written id defeats the identity check entirely.',
     }
   }
@@ -2265,7 +2429,7 @@ if (codexUnavailable) {
     codex_brief_tag: prior.last_codex_brief_tag || null,
     blockers: [`codex has no TRUSTWORTHY verdict (${why}) for round ${priorRound} — retrying codex on the SAME brief, NOT advancing the round, NOT re-running the Claude side`],
     prior_state: Object.assign({}, prior, { codex_unavailable_streak: streak }),  // unchanged EXCEPT streak++
-    agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+    agent_budget: agentBudget(),
     recommended_next_action: [
       `Codex has no trustworthy verdict for round ${priorRound} (${why}); attempt ${streak}/${MAX_CODEX_UNAVAIL}.`,
       `RE-RUN codex on the SAME brief: take the brief VERBATIM from prior_state.last_codex_brief (threaded above). Do NOT guess a path — the brief file is PER-RUN UNIQUE (mktemp) and there is NO deterministic /tmp/dual-audit/brief_<tag>.md; assuming one would fail, or worse read a STALE brief from another task. Write it to a FRESH unique file, then run: mkdir -p /tmp/dual-audit ; B=$(mktemp --suffix=.md /tmp/dual-audit/brief_${prior.last_codex_brief_tag || 'retry'}.XXXXXX) ; write the brief VERBATIM into "$B" ; ~/bin/codex-audit exec --sandbox read-only --skip-git-repo-check -o "$B.codex.txt" - < "$B" ; VERIFY EXIT=0. The -o output file MUST be unique-per-run like this (derived from the mktemp $B): redirecting to a FIXED shared path is a documented cross-task contamination route (see ACCEPTED_BOUNDARIES in ~/bin/codex-audit).`,
@@ -2400,7 +2564,7 @@ if (prevCodexRaw && prior) {
       blockers: [`the supplied codex verdict's VERDICT..END block does not carry this audit's AUDIT-ID. Expected ${expectedAuditId}; block carried: ${seen}. It cannot be proven to answer THIS audit's round-${priorRound} brief — REFUSED, not merged, because merging it would silently import another project's APPROVE/REJECT into this audit. NOTE the honest limit of this check: it detects MIS-THREADING (the realistic failure), not forgery — an auditor that copies the id can still assert anything, so it is an identity check, not a proof of provenance.`],
       unresolved_p0: (prior.open_p0s || []),
       demoted_p0: demotedLog,
-      agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+      agent_budget: agentBudget(),
       recommended_next_action: `Do NOT paste the AUDIT-ID in by hand — that forges the very proof this check exists for. Re-run codex on THIS audit's brief (prior_state.last_codex_brief already contains the AUDIT-ID line) via ~/bin/codex-audit, capture its output to a UNIQUE file, and pass that verdict back with its exit code.`,
     }
   }
@@ -2416,7 +2580,7 @@ if (prevCodexRaw && prior) {
       audit_stage: 'escalate_to_user', convergence_status: 'not_converged',
       blockers: [`HARD_TOTAL_CEILING (${HARD_TOTAL_CEILING}) exceeded (total_used=${ledger.totalUsed}) — fail-closed before declaring any result`],
       demoted_p0: demotedLog,
-      agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+      agent_budget: agentBudget(),
       recommended_next_action: 'Agent budget ceiling exceeded; do NOT trust an over-budget result. Surface unresolved issues to the user.',
     }
   }
@@ -2669,7 +2833,7 @@ if (prevCodexRaw && prior) {
       convergence_status: MODE === 'codex_only' ? 'converged_single_seat' : 'converged',
       demoted_p0: demotedLog,   // findings demoted in earlier rounds: they do not block, but they must reach a human with the terminal
       needs_expert_signoff: false,
-      agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed, codex_in_main_loop: priorRound },
+      agent_budget: agentBudget({ codex_in_main_loop: priorRound }),
       literature_conflicts: allLit,
       // 🔴 AUDIT panel-self-0818 (P0 #4/#6/#10) — this sentence used to be emitted verbatim for
       // `codex_only` too, a mode that dispatches ZERO Claude seats by design.  The reader was told
@@ -2697,7 +2861,7 @@ if (prevCodexRaw && prior) {
       unanchored_claims: needsSignoff ? gate.unanchored : [],
       unanchored_biology_claims: needsSignoff ? gate.unanchored : [],
       literature_conflicts: allLit,
-      agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed, codex_in_main_loop: priorRound },
+      agent_budget: agentBudget({ codex_in_main_loop: priorRound }),
       recommended_next_action: needsSignoff
         ? 'THIS NEEDS YOUR EXPERT SIGN-OFF: AI agreed but key claims are not anchored to a decisive cross-validated evidence chain. Review unanchored_claims + literature_conflicts + evidence; AI agreement != truth.'
         : 'NOT converged within cap (see blockers/unresolved_p0). Surface to the user; do NOT pass unverified output down the chain.',
@@ -2769,7 +2933,7 @@ if (ledger.totalUsed >= HARD_TOTAL_CEILING) {   // P0-3 fail-closed: do NOT open
     gate_codes: (priorConvergenceNote && priorConvergenceNote.codes) || [],
     prior_round_note: priorConvergenceNote,
     unresolved_p0: openP0s,
-    agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+    agent_budget: agentBudget(),
     recommended_next_action: 'Agent budget ceiling reached (fail-closed). Do NOT spawn more agents or run more codex passes; surface unresolved_p0 + evidence to the user.',
   }
 }
@@ -2783,7 +2947,7 @@ if (n === 1 && !hasIndependentR1Source) {
     ...resultBase, rounds_run: 0, converged: false,
     audit_stage: 'escalate_to_user', convergence_status: 'not_converged',
     blockers: ['no independent R1 source: every raw_source/canonical_doc was absent or Claude-generated (provenance-filtered) and the project has no canonical docs — the independent Codex would have nothing real to read, so R1 independence is vacuous (fail-closed)'],
-    agent_budget: { total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed },
+    agent_budget: agentBudget(),
     recommended_next_action: 'Provide at least one NON-Claude-generated source (absolute path) in contextPack.raw_sources or canonical_docs, or use a known project with canonical docs, or mark needs_expert_signoff. Cannot run a meaningful independent R1 with no real source.',
   }
 }
@@ -2829,6 +2993,7 @@ return {
     run_id: RUN_ID || null,      // pass back UNCHANGED; it is part of the fingerprint
     round: n,
     cumulative_used: ledger.totalUsed,
+    seat_retries_cumulative: ledger.seatRetries,   // telemetry only; gates nothing (see priorSeatRetries)
     claude_verdicts_raw: claudeRound.auditors.map(a => a.raw),
     // ⚠️ A seat's lens string must cross the bridge together with its verdict. R2 REBUILDS the previous
     // claudeRound FROM prior_state, and the rebuild only has the verdict text - role was lost right
@@ -2863,7 +3028,7 @@ return {
     codex_unavailable_streak: 0,                     // reset: codex DID produce output to reach this round
   },
   prior_round_note: priorConvergenceNote,
-  agent_budget: { claude_used: ledger.claudeUsed, codex_deferred: ledger.codexDeferred, total_used: ledger.totalUsed, hard_ceiling: HARD_TOTAL_CEILING, cumulative_in: cumulativeUsed, invalid_results: ledger.invalid },
+  agent_budget: agentBudget({ claude_used: ledger.claudeUsed, codex_deferred: ledger.codexDeferred, invalid_results: ledger.invalid }),
   recommended_next_action: [
     `ROUND ${n} ${n === 1 ? 'INDEPENDENT' : 'CROSS-EXAMINE'} — Claude side done; codex pending (HYBRID). MAIN-LOOP next:`,
     `1) write codex_brief to a PER-RUN UNIQUE file (avoid clobber by a parallel same-project panel): mkdir -p /tmp/dual-audit ; B=$(mktemp --suffix=.md /tmp/dual-audit/brief_${tag}.XXXXXX) ; echo "$B" — then write codex_brief VERBATIM into THAT exact printed path (readable ${tag} prefix kept; mktemp suffix makes it collision-free). The brief CONTENT is also threaded in prior_state.last_codex_brief, so a false-death re-run just re-writes it to a fresh unique path.`,

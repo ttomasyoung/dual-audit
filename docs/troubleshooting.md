@@ -45,7 +45,9 @@ Same empty output, and the hand check above still succeeds — but the reviewer'
 the tool result *"Command did not complete within its 600s timeout and was moved to the background"*.
 
 The reviewer agent runs the wrapper as a **single** shell command, and the caller cuts that command
-off at its own ceiling — in Claude Code, **120 seconds unless the call asks for more**, up to 600.
+off at its own ceiling — in Claude Code, **120 seconds unless the call asks for more**, up to 600 on an
+unconfigured machine (`BASH_MAX_TIMEOUT_MS` in the settings env raises it; see the long seat in
+[configuration.md](configuration.md)).
 Whatever the review then produces is written to a file the agent is no longer waiting on, so it
 returns nothing.
 
@@ -66,7 +68,10 @@ still see it:
 - do not raise `DUAL_AUDIT_TIMEOUT` on its own. A budget larger than
   `DUAL_AUDIT_OUTER_BUDGET` cannot be spent — it only moves the failure from a message you can read
   to silence. If your controller has no 600 s ceiling, raise `DUAL_AUDIT_OUTER_BUDGET` too; see
-  [configuration.md](configuration.md).
+  [configuration.md](configuration.md);
+- if the review genuinely needs more than nine minutes in one piece, use the long seat: raise
+  `BASH_MAX_TIMEOUT_MS` in the Claude settings env and pass `codex_timeout_s` to the driver.
+  The wrapper refuses (`8`) if the cap was not actually raised, instead of starting and being killed.
 
 ### `INVALID_AUDIT`
 
@@ -140,7 +145,7 @@ need different fixes:
 | `code` | `why`, in short | Fix |
 |---|---|---|
 | `EMPTY_VERDICT_TEXT` | nothing came back at all | The reviewer produced nothing, or the agent call failed. Check the wrapper's own exit code below. |
-| `LAUNCHED_BUT_NO_VERDICT` | the wrapper announced the launch, then nothing came back | **The reviewer really did start and was killed part-way.** Almost always a caller wall-clock ceiling shorter than a review needs: set `DUAL_AUDIT_OUTER_BUDGET` to the real ceiling, and give the command itself the longest timeout the caller allows. Infrastructure — never "the review found nothing". |
+| `LAUNCHED_BUT_NO_VERDICT` | the wrapper announced the launch, then nothing came back | **The reviewer really did start and was killed part-way.** Almost always a caller wall-clock ceiling shorter than a review needs: set `DUAL_AUDIT_OUTER_BUDGET` to the real ceiling, and give the command itself the longest timeout the caller allows — or, for a review that needs more than the tool's default ceiling, the long seat (`codex_timeout_s`). Infrastructure — never "the review found nothing". |
 | `NO_BLOCK_NO_MARKER` | no verdict block and no marker | The reviewer produced no verdict, or the wrapper ran without `--emit-rc`. |
 | `MARKER_WITHOUT_BLOCK` | a marker, but no `VERDICT..END` block anywhere | The reviewer produced no verdict; the marker you see is the wrapper's fallback append. |
 | `MARKER_OUTSIDE_ANY_BLOCK` | a block exists, the marker is outside every one | The wrapper did not take the injection path — check that the agent definition passes `--emit-rc`, and that no old command template is in use. |

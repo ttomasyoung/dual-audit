@@ -20,6 +20,8 @@ const DRIVER = process.env.DUAL_AUDIT_DRIVER || resolve(HERE, '../runtime/claude
 const RCM = process.env.DUAL_AUDIT_RC_MARKER || '__DUAL_AUDIT_RC'
 // Derived, not hardcoded: the two builds spell their markers differently and share the prefix.
 const LAUNCHM = RCM.replace(/_RC$/, '_LAUNCHED')
+// The environment-variable prefix the build under test writes into its seat-params line (long seat).
+const ENVP = process.env.DUAL_AUDIT_ENVP || 'DUAL_AUDIT'
 const SRC0 = readFileSync(DRIVER, 'utf8').replace('export const meta', 'const meta')
 const AF = Object.getPrototypeOf(async function () {}).constructor
 
@@ -36,6 +38,7 @@ async function runDriver({ args = { task: 't' }, panelReplies = [], agentReply =
   const src = mutate ? mutate(SRC0) : SRC0
   const calls = { panel: 0, agent: 0 }
   const panelArgsSeen = []
+  const agentPrompts = []   // what the forwarder was actually handed, byte for byte
   const workflow = async (_ref, callArgs) => {
     panelArgsSeen.push(callArgs)
     const i = calls.panel++
@@ -43,7 +46,8 @@ async function runDriver({ args = { task: 't' }, panelReplies = [], agentReply =
     if (r instanceof Error) throw r
     return r
   }
-  const agent = async () => {
+  const agent = async (prompt) => {
+    agentPrompts.push(String(prompt))
     const i = calls.agent++
     const t = typeof agentReply === 'function' ? agentReply(i) : agentReply
     return { verdict_text: t }
@@ -51,7 +55,7 @@ async function runDriver({ args = { task: 't' }, panelReplies = [], agentReply =
   const fn = new AF('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'workflow', src)
   const r = await fn(args, agent, async (t) => Promise.all(t.map(x => x())), () => {}, () => {},
     { total: null, spent: () => 0, remaining: () => Infinity }, workflow)
-  return { r, calls, panelArgsSeen }
+  return { r, calls, panelArgsSeen, agentPrompts }
 }
 
 let pass = 0, fail = 0
@@ -131,9 +135,18 @@ await t('A4 codex_unavailable -> INFRASTRUCTURE_BLOCKED',
   (s) => s.replace("const INFRA_STATUSES = ['codex_unavailable', 'prior_state_missing_brief']",
                    "const INFRA_STATUSES = ['prior_state_missing_brief']"))
 
-await t('A5 identity mismatch -> INVALID_AUDIT',
-  (m) => runDriver({ panelReplies: [{ converged: false, convergence_status: 'prior_state_identity_mismatch' }], mutate: m }),
-  (r) => r.terminal_state === 'INVALID_AUDIT')
+// 🔴 The fixture carries `audit_stage: 'escalate_to_user'` because THAT is what the panel actually emits
+// alongside this status (panel: the identity-mismatch return sets both). The first version omitted the
+// stage, and an independent sweep showed what that cost: with the two identity statuses deleted from
+// INVALID_STATUSES the whole release gate stayed green, because a stage-less object falls through to the
+// trailing fail-closed default, which also answers INVALID_AUDIT. The case passed for a reason other than
+// the one it names (shape 4: reader-binding too loose). Against the REAL shape the escalation stage is read
+// first and the same deletion yields NOT_CONVERGED - a refused, never-adjudicated state would then read as
+// substantive reviewer disagreement, carrying findings inherited from the state that was just refused.
+await t('A5 identity mismatch -> INVALID_AUDIT (in the shape the panel really emits: with the escalation stage)',
+  (m) => runDriver({ panelReplies: [{ converged: false, audit_stage: 'escalate_to_user', convergence_status: 'prior_state_identity_mismatch', unresolved_p0: ['inherited from the refused state'] }], mutate: m }),
+  (r) => r.terminal_state === 'INVALID_AUDIT',
+  (s) => s.replace("  'prior_state_identity_mismatch', 'codex_verdict_identity_mismatch',\n", ''))
 
 // The fixture deliberately carries BOTH an `error` and an escalation stage. With only
 // the trailing fail-closed default, such a result would be classified NOT_CONVERGED —
@@ -358,6 +371,98 @@ await t('C9 the diagnostic carries the evidence it judged, so the reader need no
     return d.verdict_text_len === FORWARDER_STATUS.length && /No VERDICT block exists\.$/.test(d.verdict_text_tail || '')
   },
   (s) => s.replace('verdict_text_tail: String(verdictText).slice(-160),', 'verdict_text_tail: null,'))
+
+console.log('=== D. The long seat (codex_timeout_s) ===')
+// The Bash tool's 600000 ms is a default, not a ceiling: the CLI computes max(BASH_MAX_TIMEOUT_MS,
+// default). A caller passes codex_timeout_s and the driver prefixes the forwarder's task with one
+// seat-params line. These cases pin the arithmetic, the pass-through, the refusal of bad values, and
+// the launch-marker check that tells an applied long seat from one that silently ran on the default.
+const HANDOFF = { audit_stage: 'r1_handoff_to_codex', codex_brief: 'BRIEF BODY', prior_state: { round: 1 } }
+const DONE = { converged: true, convergence_status: 'converged', audit_stage: 'converged_r1' }
+const withLaunch = (launched, rc = 0) => `${LAUNCHM}=${launched}\n` + block(rc)
+const seatEntry = (r) => ((r && r.driver_trace) || []).find(x => x && x.long_seat)
+
+await t('D1 codex_timeout_s prefixes the forwarder prompt with ONE seat-params line carrying the budget arithmetic',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: withLaunch(2400), mutate: m }),
+  (r, g) => {
+    const p = g.agentPrompts[0] || ''
+    const lines = p.split('\n')
+    return lines[0] === `<!-- dual-audit:seat-params timeout_ms=2460000 env="${ENVP}_TIMEOUT=2400 ${ENVP}_OUTER_BUDGET=2460" -->`
+      && lines.slice(1).join('\n') === 'BRIEF BODY' && r.terminal_state === 'CONVERGED'
+  },
+  (s) => s.replace('const LANE_HEADROOM_S = 60', 'const LANE_HEADROOM_S = 0'))
+
+await t('D2 without codex_timeout_s the forwarder prompt is exactly the brief (the default lane is untouched)',
+  (m) => runDriver({ panelReplies: [HANDOFF, DONE], agentReply: block(0), mutate: m }),
+  (r, g) => g.agentPrompts[0] === 'BRIEF BODY' && r.terminal_state === 'CONVERGED',
+  (s) => s.replace("agent(seatParamsLine ? seatParamsLine + '\\n' + String(brief) : String(brief), {",
+                   "agent(seatParamsLine + '\\n' + String(brief), {"))
+
+// Present-with-a-bad-value is refused; only ABSENT selects the default. null, '' and blanks are bad values:
+// a review showed the first version read them as omission, so a caller who wrote the key and left it empty
+// silently got the 540 s seat and a converged result it would read as the long review it asked for.
+for (const bad of ['abc', '100', '0', '-5', '2400.5', '99999999', '0540', '540', '599', '', '   ', null]) {
+  await t(`D3 codex_timeout_s=${JSON.stringify(bad)} is refused as INVALID_AUDIT before the panel is ever called, not run on the default seat`,
+    (m) => runDriver({ args: { task: 't', codex_timeout_s: bad }, panelReplies: [HANDOFF, DONE], agentReply: block(0), mutate: m }),
+    (r, g) => r.terminal_state === 'INVALID_AUDIT' && r.converged === false && /codex_timeout_s/.test(r.error || '') && g.calls.panel === 0,
+    bad === '599' ? (s) => s.replace('n < LANE_MIN_S ||', 'false ||')
+    : bad === null ? (s) => s.replace("const seatKeyPresent = allReadableKeys(a).includes('codex_timeout_s')",
+                                      "const seatKeyPresent = allReadableKeys(a).includes('codex_timeout_s') && a.codex_timeout_s != null")
+    : bad === '   ' ? (s) => s.replace("const seatKeyPresent = allReadableKeys(a).includes('codex_timeout_s')",
+                                       "const seatKeyPresent = allReadableKeys(a).includes('codex_timeout_s') && String(a.codex_timeout_s).trim() !== ''")
+    : bad === '' ? (s) => s.replace("const seatKeyPresent = allReadableKeys(a).includes('codex_timeout_s')",
+                                    "const seatKeyPresent = allReadableKeys(a).includes('codex_timeout_s') && a.codex_timeout_s !== ''")
+    : bad === '540' ? (s) => s.replace('n < LANE_MIN_S ||', 'n < DEFAULT_SEAT_S ||')
+    : undefined)
+}
+
+await t('D4 codex_timeout_s reaches the panel like every other caller key (it is part of the audit identity)',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: withLaunch(2400), mutate: m }),
+  (r, g) => g.panelArgsSeen[0].codex_timeout_s === 2400 && g.panelArgsSeen[1].codex_timeout_s === 2400,
+  (s) => s.replace('  panelArgs.codex_timeout_s = n\n', '  delete panelArgs.codex_timeout_s\n'))
+
+await t('D5 the launch marker confirms the long seat was applied (a clamp of up to 200 s is still applied)',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: withLaunch(2200), mutate: m }),
+  (r) => { const e = seatEntry(r); return !!e && e.long_seat.applied === true && e.long_seat.launched_s === 2200 && e.long_seat.requested_s === 2400 },
+  (s) => s.replace('launched >= seatTimeoutS - LANE_CLAMP_TOLERANCE_S', 'launched >= seatTimeoutS'))
+
+await t('D5b a shortfall beyond the clamp allowance is NOT applied (2199 for 2400)',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: withLaunch(2199), mutate: m }),
+  (r) => { const e = seatEntry(r); return !!e && e.long_seat.applied === false && e.long_seat.launched_s === 2199 },
+  (s) => s.replace('const LANE_CLAMP_TOLERANCE_S = 200', 'const LANE_CLAMP_TOLERANCE_S = 201'))
+
+await t('D6 a seat that ran on the default 540 s is reported NOT applied, while its verdict is still forwarded with its exit code',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: withLaunch(540), mutate: m }),
+  (r, g) => { const e = seatEntry(r); return !!e && e.long_seat.applied === false && e.long_seat.launched_s === 540 && r.terminal_state === 'CONVERGED' && g.panelArgsSeen[1].codex_exit_code === 0 },
+  (s) => s.replace('launched > DEFAULT_SEAT_S && launched >= seatTimeoutS - LANE_CLAMP_TOLERANCE_S', 'launched != null'))
+
+// The review's exact case: the smallest request the lane accepts, and a seat that ignored the line. Under the
+// first version (applied := launched >= floor(0.9*t)) this read as APPLIED, because floor(0.9*600) = 540.
+await t('D9 t=600 with a seat that fell back to the default 540 is NOT applied (the 541..600 false-pass window is closed)',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 600 }, panelReplies: [HANDOFF, DONE], agentReply: withLaunch(540), mutate: m }),
+  (r) => { const e = seatEntry(r); return !!e && e.long_seat.applied === false && e.long_seat.launched_s === 540 && r.terminal_state === 'CONVERGED' },
+  (s) => s.replace('launched > DEFAULT_SEAT_S &&', 'launched >= DEFAULT_SEAT_S &&'))
+
+await t('D10 a seat that retried prints two markers; the LAST one is the one read (540 then 2400 -> applied)',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: `${LAUNCHM}=540\n` + withLaunch(2400), mutate: m }),
+  (r) => { const e = seatEntry(r); return !!e && e.long_seat.applied === true && e.long_seat.launched_s === 2400 },
+  (s) => s.replace('while ((lm = LAUNCHED_VALUE_RE.exec(String(verdictText))) !== null) launched = parseInt(lm[1], 10)',
+                   'if ((lm = LAUNCHED_VALUE_RE.exec(String(verdictText))) !== null) launched = parseInt(lm[1], 10)'))
+
+await t('D11 the panel receives the parsed integer, not the caller\'s spelling (" 2400 " -> 2400)',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: ' 2400 ' }, panelReplies: [HANDOFF, DONE], agentReply: withLaunch(2400), mutate: m }),
+  (r, g) => g.panelArgsSeen[0].codex_timeout_s === 2400 && r.terminal_state === 'CONVERGED',
+  (s) => s.replace('  panelArgs.codex_timeout_s = n\n', '\n'))
+
+await t('D7 no launch marker at all is reported as launched_s=null, applied=false — never as applied',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: block(0), mutate: m }),
+  (r) => { const e = seatEntry(r); return !!e && e.long_seat.applied === false && e.long_seat.launched_s === null },
+  (s) => s.replace('const applied = launched != null && launched > DEFAULT_SEAT_S && launched >= seatTimeoutS - LANE_CLAMP_TOLERANCE_S', 'const applied = true'))
+
+await t('D8 without the key no long_seat entry is written (the diagnostic belongs only to the lane that asked)',
+  (m) => runDriver({ panelReplies: [HANDOFF, DONE], agentReply: withLaunch(540), mutate: m }),
+  (r) => !((r.driver_trace || []).some(x => x && x.long_seat)),
+  (s) => s.replace('if (seatTimeoutS != null) {\n    let lm, launched = null', 'if (true) {\n    let lm, launched = null'))
 
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
 process.exit(fail ? 1 : 0)

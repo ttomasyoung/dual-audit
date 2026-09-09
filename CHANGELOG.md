@@ -5,6 +5,50 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.3.0]
+
+**Three assertions in this suite could not fail.** A sweep that asked, of every assertion, "would
+this fail if the thing it pins were broken?" found that the answer was no for three of them — and two
+were on load-bearing paths. Replacing the expert-sign-off escalation with a constant `false` left the
+entire release gate green: every assertion that touched the field checked `=== false` on fixtures where
+the claim gate is structurally false, so that conjunct could never go false. Nothing anywhere pinned
+that the panel ever RAISES the flag, which is the path by which a claim that cannot be anchored reaches
+a human instead of being reported as an ordinary non-convergence. Deleting both identity-mismatch
+statuses from the driver's `INVALID_STATUSES` also left everything green, because that case's fixture
+omitted the `audit_stage` the panel really emits and was therefore classified by the trailing
+fail-closed default instead — it passed for a reason other than the one it names, so against a real
+panel result the same deletion turns a refused, never-adjudicated state into what reads as substantive
+reviewer disagreement, carrying findings inherited from the state that was just refused. Both now have
+a case built on the shape the panel actually produces, and the exact mutation that went unnoticed is
+pinned as its mutant.
+
+**A skipped case no longer reads as a covered one.** The wrapper suite skips its launch-marker group
+where the environment cannot reach a reviewer, and its post-lock budget case where the build under test
+pins its lock to a fixed global path — and then reported `44 passed / 0 failed`. Skips are now counted
+and named in the result line. The exit status is deliberately unchanged: a skip is not a failure, and
+making it one would turn the parity run red for a difference that is already recorded and accepted.
+
+**The long seat.** The Bash tool's 600 s ceiling turned out to be a default, not a limit: the CLI
+computes it as `max(BASH_MAX_TIMEOUT_MS or 600000, BASH_DEFAULT_TIMEOUT_MS or 120000)`. Measured, not inferred — with the variable set a
+615 s foreground command survived; without it the same command was killed at exactly 600 s. The
+driver now accepts `codex_timeout_s` and, when given, prefixes the reviewer's brief with one
+`<!-- dual-audit:seat-params ... -->` line carrying the Bash timeout and the wrapper budget
+(`OUTER_BUDGET = t + 60`, `timeout_ms = (t + 60) × 1000`). The reviewer agent definition reads that
+line; without it nothing changes and the brief is byte-identical to before. Two guards keep a
+misconfigured long seat loud: the wrapper refuses (`8`) a declared budget above what the Claude Code
+Bash tool can grant (under `CLAUDECODE=1`, comparing against `BASH_MAX_TIMEOUT_MS`), and the driver
+records `long_seat: { requested_s, launched_s, applied }` from the wrapper's launch marker so a seat
+that silently ran on the default budget is reported rather than assumed. `test_agentdef.sh` now
+checks the seat-params token in both directions across the definition and the driver; the wrapper
+suite gained the cap-guard cases and a mutant; the driver suite gained section D.
+
+Measured end to end after the lane shipped: a real review of nine files (7433 lines, roughly 440
+assertions) ran **878 seconds** inside one synchronous call and returned a complete verdict. Under the
+unconfigured ceiling that review is cut off at 600 s with an empty stdout — indistinguishable from a
+reviewer that read everything and had nothing to say. Two smaller loads on the same lane finished in
+307 s and 374 s, so the ceiling was never what bounded them: crossing 600 s takes a load on the order of
+thousands of lines judged item by item.
+
 ## [1.2.0]
 
 **Read this first if anything you own branches on `terminal_state` or `converged`.** A run with

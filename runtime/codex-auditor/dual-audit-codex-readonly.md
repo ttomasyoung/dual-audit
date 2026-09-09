@@ -46,14 +46,16 @@ block itself breaks: a loud failure instead of a silent one.
   opening and closing delimiter — they must match.
 - Keep `--skip-git-repo-check` and `--sandbox read-only`.
 
-<!-- dual-audit:bash-timeout-contract required_ms=580000 tool_default_ms=120000 tool_max_ms=600000 -->
+<!-- dual-audit:bash-timeout-contract required_ms=580000 tool_default_ms=120000 tool_max_ms=600000 seat_params_token=dual-audit:seat-params -->
 
 **Give that Bash call the longest timeout your caller allows, explicitly.** In Claude Code that is
 `timeout: 580000` — the tool's own default is **120000 ms, two minutes**, and a review takes several.
 A call made without the parameter is killed at two minutes with exit 143 and an empty stdout, no
-matter how long anyone was willing to wait. 580000 sits just under the tool's 600000 maximum and just
-above the wrapper's own `TIMEOUT + KILL_AFTER` (570 s), so the wrapper reaches its limit first and
-fails **loudly**, with `__DUAL_AUDIT_RC=124` inside the block, instead of being killed into silence.
+matter how long anyone was willing to wait. 580000 sits just under the tool's 600000 maximum (the
+maximum of an unconfigured machine; `BASH_MAX_TIMEOUT_MS` in the settings env raises it, which only
+matters for the long seat described below) and just above the wrapper's own `TIMEOUT + KILL_AFTER`
+(570 s), so the wrapper reaches its limit first and fails **loudly**, with `__DUAL_AUDIT_RC=124`
+inside the block, instead of being killed into silence.
 
 ⚠️ Set it even if you are told the ceiling is fixed. This was observed in a single panel: the
 round-1 seat passed the parameter and returned a full verdict in over nine minutes; the round-2 seat
@@ -64,6 +66,30 @@ which is indistinguishable from a reviewer that read everything and had nothing 
 ⚠️ **Killed at exactly two minutes? Do not retry the same command.** Retrying without the parameter
 reproduces the same kill and spends tokens each time. Add the timeout and run once more; if that also
 fails, say so in one line and return what the wrapper actually printed.
+
+**Long seat — only when the FIRST line of the brief you received is a `<!-- dual-audit:seat-params ... -->`
+comment.** The driver puts that line there when the caller asked for a longer review
+(`codex_timeout_s`). It looks like:
+
+```
+<!-- dual-audit:seat-params timeout_ms=2460000 env="DUAL_AUDIT_TIMEOUT=2400 DUAL_AUDIT_OUTER_BUDGET=2460" -->
+```
+
+When it is present, and ONLY then:
+
+1. Pass **`timeout: <the timeout_ms from that line>`** on the Bash call instead of 580000. The machine's
+   Bash cap has been raised for this (`BASH_MAX_TIMEOUT_MS` in the settings env); if it has not, the
+   wrapper refuses at once with rc=8 and a message naming the cap — it does not start and then get killed.
+2. Put the `env` assignments in front of the wrapper on the same command line, exactly as given:
+   `env DUAL_AUDIT_TIMEOUT=2400 DUAL_AUDIT_OUTER_BUDGET=2460 dual-audit-codex exec --sandbox read-only --skip-git-repo-check --emit-rc - <<'DUAL_AUDIT_BRIEF_HEREDOC'`.
+   They give the wrapper a truthful budget; without them it times itself out at 540 s as usual and the
+   extra time is simply never used.
+3. Paste the brief into the heredoc verbatim as always — **including that first line**. Strip nothing.
+
+Everything else on this page is unchanged. No seat-params line → exactly the standard call with
+`timeout: 580000`. The wrapper prints `__DUAL_AUDIT_LAUNCHED=<seconds>` the instant it hands control to
+the reviewer; the driver compares that number with what it asked for, so a long seat that silently ran
+on the default budget is **detected, not assumed**.
 
 Then return the command's stdout EXACTLY as it came out. No preface, no commentary, no summary of
 your own.

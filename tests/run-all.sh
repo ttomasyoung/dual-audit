@@ -57,6 +57,7 @@ done
 if [ "$static_rc" -eq 0 ]; then echo "  PASS all scripts parse"; else failed+=("static checks"); fi
 
 run "panel protocol"        node tests/test_panel.mjs
+run "seat attempt ledger"   node tests/test_seat_attempt_ledger.mjs
 run "driver and terminal states" node tests/test_driver.mjs
 run "args size gate"       node tests/test_args_size_gate.mjs
 run "profile parser"        node tests/test_profile.mjs

@@ -128,9 +128,10 @@ silently becomes the default can buy *looser* runtime parameters than the user a
 ### The caller's ceiling, and the three variables that share it
 
 `DUAL_AUDIT_OUTER_BUDGET` is the wall-clock ceiling **the caller enforces and the wrapper cannot
-raise**. It defaults to 600 because that is the ceiling of the tool this wrapper is most often
-invoked from: the reviewer agent runs the wrapper as a single shell command, and Claude Code cuts
-that command off after 600 seconds. When the outer limit fires first, this wrapper's own timeout and
+raise from inside**. It defaults to 600 because that is the ceiling of the tool this wrapper is most
+often invoked from: the reviewer agent runs the wrapper as a single shell command, and Claude Code
+cuts that command off after 600 seconds **unless the machine has raised that cap** (see "The long
+seat" below). When the outer limit fires first, this wrapper's own timeout and
 trap never run, stdout is empty, and **an audit that died is indistinguishable from one that found
 nothing** — the exact confusion this project exists to remove.
 
@@ -153,6 +154,47 @@ announces it.
 `DUAL_AUDIT_OUTER_BUDGET`. The wrapper deliberately **warns and tightens** rather than refusing
 long reviews outright, so a long legitimate review is never silently cut short — but with the
 default in place it will tighten toward 600.
+
+### The long seat: reviews longer than the tool's default ceiling
+
+The 600 s figure is the Claude Code Bash tool's **unconfigured** maximum, not a hard one. The CLI
+computes it as `max(BASH_MAX_TIMEOUT_MS, 120000)`, and 600000 only while that variable is unset —
+read from the binary and confirmed by a measurement in which a 615 s foreground command survived with
+the variable set and was killed at exactly 600 s without it. So a machine that puts, for example,
+`"BASH_MAX_TIMEOUT_MS": "3600000"` into the `env` block of its Claude settings can hold one reviewer
+seat open for up to an hour. The CLI re-reads its settings while running, so the change applied to a
+session that was already open (measured); the Bash tool's own description keeps quoting the number it
+was rendered with at start-up, so check `echo $BASH_MAX_TIMEOUT_MS` rather than the prose.
+
+The driver exposes this as **one caller argument, `codex_timeout_s`** (seconds the reviewer may run,
+integer, at least 600 — it must exceed the wrapper's default 540 s, or an ignored line could not be told
+from an applied one). The key is present-or-absent: present with anything else, including null or an
+empty string, is refused; only an absent key selects the default seat. When present, the driver prefixes
+the reviewer's brief with a single line
+
+```
+<!-- dual-audit:seat-params timeout_ms=2460000 env="DUAL_AUDIT_TIMEOUT=2400 DUAL_AUDIT_OUTER_BUDGET=2460" -->
+```
+
+and the reviewer agent definition tells the seat what to do with it: pass that `timeout_ms` on its Bash
+call and put those two assignments in front of the wrapper. The arithmetic is fixed —
+`OUTER_BUDGET = t + 60` and `timeout_ms = (t + 60) × 1000` — so the wrapper still reaches its own
+limit first and fails loudly. Without the argument nothing changes: the brief handed to the seat is
+byte-identical to what it always was.
+
+Two things keep a misconfigured long seat from turning into the silent kill this section is about:
+
+- **The wrapper refuses a budget the caller cannot grant.** Under Claude Code (`CLAUDECODE=1`) it
+  compares the declared `DUAL_AUDIT_OUTER_BUDGET` with `BASH_MAX_TIMEOUT_MS` (600000 when unset) and
+  exits `8` with a message naming both numbers *before* anything starts. A terminal or scheduler
+  caller has no such cap and is not checked.
+- **The driver checks the launch marker.** The wrapper prints `__DUAL_AUDIT_LAUNCHED=<seconds>` with
+  the timeout it really granted (the last such line, since a retried seat prints one per attempt); the
+  driver records `long_seat: { requested_s, launched_s, applied }` in `driver_trace`, where `applied`
+  requires both `launched > 540` (the default lane can never announce more) and `launched >= t − 200`
+  (the wrapper trims at most its own pre-steps). A seat that ignored the line and ran on the default
+  540 s is therefore reported, not assumed. The verdict is still forwarded — it is a valid verdict, it
+  just did not use the extra time.
 
 `DUAL_AUDIT_TIMEOUT` defaults to 540 for the same reason: at 540 the wrapper reaches its own limit
 first, so you get `124` (timed out) with a message, inside the ceiling. For reference, a real review

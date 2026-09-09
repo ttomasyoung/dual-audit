@@ -171,11 +171,42 @@ _numenv STDIN_TIMEOUT DUAL_AUDIT_STDIN_TIMEOUT 120   3600
 # failure direction is the worst one available: the OUTER limit fires first, this wrapper's own timeout
 # and trap never run, stdout is empty, and an audit that died is indistinguishable from one that found
 # nothing. So model the caller's ceiling explicitly. 600 is the default because that is the ceiling of
-# the tool this wrapper is most often invoked from.
+# the tool this wrapper is most often invoked from — while that tool is UNCONFIGURED; it can be raised
+# (see the cap check right below), and a caller that raised it declares the larger budget here.
 # ⚠️ WARN AND TIGHTEN, never refuse outright for being "too long": this wrapper is also run from a
 #    terminal and from schedulers that have no such ceiling, and a hard clamp there would silently cut
 #    legitimate long reviews short.
 _numenv OUTER_BUDGET  DUAL_AUDIT_OUTER_BUDGET  600   604800
+# ==== The caller's ceiling is modelled, not assumed ====
+# OUTER_BUDGET is what the caller DECLARES it can hold this call open for. When the caller is Claude
+# Code's Bash tool (it exports CLAUDECODE=1 into every command it runs), the longest timeout that tool
+# can be asked for is max(BASH_MAX_TIMEOUT_MS, BASH_DEFAULT_TIMEOUT_MS), each falling back (600000 / 120000)
+# when unset or not a positive integer. Read from the CLI binary, not from documentation:
+#   function B9e(e){let n=e.BASH_MAX_TIMEOUT_MS;if(n){let r=nl(n);if(!isNaN(r)&&r>0)return Math.max(r,EHe(e))}return Math.max(600000,EHe(e))}
+# A declared budget above that cap is a promise the caller cannot keep: the run would start and be
+# killed into silence, the exact failure the budget arithmetic above exists to prevent. Refuse instead.
+# ⚠️ Only under CLAUDECODE. A terminal or cron caller has no such cap, and clamping there would cut
+#    legitimate long reviews — the same reason OUTER_BUDGET itself only warns.
+# ⚠️ This compares the DECLARED budget with the CAP. The timeout this particular call was actually
+#    given is invisible here; that half is covered by the launch marker (__DUAL_AUDIT_LAUNCHED) and the
+#    driver's LAUNCHED_BUT_NO_VERDICT diagnosis when a seat is killed from outside.
+# ⚠️ It runs before argument parsing on purpose, so --preflight inherits it: a batch whose exported budget
+#    the harness cannot grant is refused at the gate (rc=8, a configuration error, not the token gate's 98)
+#    instead of at its first call. Any caller that dispatches only on rc=0 is unaffected.
+# The harness variable is tested for non-empty, not for a particular value: the guard must not go quiet
+# if the harness ever spells it differently.
+if [ -n "${CLAUDECODE:-}" ]; then
+  _cap_int(){ # $1=raw value -> the integer the binary would use, or '' when it would ignore the value
+    case "${1:-}" in ''|*[!0-9]*) echo '' ;; *) if [ "${#1}" -le 18 ] && [ "$((10#$1))" -gt 0 ]; then echo "$((10#$1))"; else echo ''; fi ;; esac; }   # 18 digits: inside the shell's 64-bit range; beyond that the value is absurd and counts as unset
+  _dflt_ms=$(_cap_int "${BASH_DEFAULT_TIMEOUT_MS:-}"); [ -n "$_dflt_ms" ] || _dflt_ms=120000
+  _max_ms=$(_cap_int "${BASH_MAX_TIMEOUT_MS:-}");     [ -n "$_max_ms" ]  || _max_ms=600000
+  _cap_ms=$(( _max_ms > _dflt_ms ? _max_ms : _dflt_ms ))
+  if [ $(( OUTER_BUDGET * 1000 )) -gt "$_cap_ms" ]; then
+    printf 'dual-audit-codex: declared outer budget OUTER_BUDGET=%ss exceeds what the Claude Code Bash tool can grant (%sms; BASH_MAX_TIMEOUT_MS=%s, BASH_DEFAULT_TIMEOUT_MS=%s). The caller cannot hold this call open that long, so the run would only be killed into silence; refusing (rc=8). Fix: set BASH_MAX_TIMEOUT_MS to at least %s in the "env" block of the Claude settings file (the CLI re-reads its settings, so this reaches a running session too), or lower the budget.\n' \
+      "$OUTER_BUDGET" "$_cap_ms" "${BASH_MAX_TIMEOUT_MS:-unset}" "${BASH_DEFAULT_TIMEOUT_MS:-unset}" "$(( OUTER_BUDGET * 1000 ))" >&2
+    exit 8
+  fi
+fi
 _T0=$(date +%s)   # entry time: the remaining budget is MEASURED from here, never summed from constants
 # 🔴 Do NOT compute the remaining budget by adding up the known stages (LOCK_WAIT + TIMEOUT + ...).
 #    That was the first implementation and an independent review demonstrated it wrong: it silently

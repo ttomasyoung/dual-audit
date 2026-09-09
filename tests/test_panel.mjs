@@ -157,6 +157,11 @@ const CLAIM_UN = 'VERDICT: APPROVE\nP0: none\nEVIDENCE: 4 samples\nANCHOR: none\
 const cxClaimA = id => `VERDICT: APPROVE\nP0: none\nEVIDENCE: 4 samples reference\nANCHOR: anchored\nUNANCHORED_CLAIMS: none\nAUDIT-ID: ${id}\nEND`
 const R1bio = (await runPanel(B_BIO, async () => CLAIM_A)).r
 const R1bioUn = (await runPanel(B_BIO, async () => CLAIM_UN)).r
+// Same claim-mode chain but mode:'quick', so roundsAllowed is 1 and the SECOND invocation lands on the
+// cap-exhausted escalate path - the ONLY path that sets needs_expert_signoff. B24 uses the default
+// two-round mode and therefore stops at the handoff, which is why nothing here reached that flag.
+const B_BIO_Q = { ...B_BIO, mode: 'quick' }
+const R1bioUnQ = (await runPanel(B_BIO_Q, async () => CLAIM_UN)).r
 
 const conv = (r) => r && r.converged === true && r.convergence_status === 'converged' && r.audit_stage === 'converged_r1' && (r.blockers || []).length === 0 && r.needs_expert_signoff === false
 const RET_R1 = (await runPanel(BSRC, async () => CLAUDE_FIVE_P0)).r
@@ -245,7 +250,11 @@ const CASES_B = [
   // B25: a blocker reachable only by reading a value the gates never consult must not converge. The
   // reviewer is told verbatim that anything outside the field shapes is refused rather than
   // reinterpreted; until this gate existed the parser only warned and the round approved.
-  { n: 'B25 a blocker hidden inside another field value cannot converge',
+  // 🔴 The NAME must say what the assertion checks. It used to read "cannot converge" while asserting
+  // only that an advisory fires - and the panel deliberately lets this converge (see the calibration
+  // below). A reader of a green suite was told a hard guarantee was covered when it was not. The
+  // structural half of this shape (an own-line `**P0**: x`) IS stopped hard, and B26 covers that.
+  { n: 'B25 a blocker hidden inside another field value is FLAGGED to a human (advisory by design, NOT a convergence gate)',
     args: { ...BSRC, prior_state: R1hid.prior_state, codex_prev_verdict_raw: cxApprove(R1hid.task_fingerprint + '_r1'), codex_exit_code: 0 },
     // 🔴 Changed to ADVISORY rather than invalidating, on the strength of a larger measured corpus.
     // The original design was calibrated on 76 verdicts and chose a hard gate. Re-calibrated on 470
@@ -275,7 +284,8 @@ const CASES_B = [
     args: { ...BSRC, prior_state: R1.prior_state, codex_prev_verdict_raw: cxMarker(A1), codex_exit_code: 0 },
     fn: () => CLAUDE_APPROVE, ok: conv },
   // B29: a colon variant is still a colon to whoever wrote it.
-  { n: 'B29 a blocker hidden behind a full-width colon cannot converge',
+  // Same correction as B25: this asserts the advisory fires, not that convergence is blocked.
+  { n: 'B29 a blocker hidden behind a full-width colon is SEEN (advisory by design, NOT a convergence gate)',
     args: { ...BSRC, prior_state: R1wid.prior_state, codex_prev_verdict_raw: cxApprove(R1wid.task_fingerprint + '_r1'), codex_exit_code: 0 },
     // As in B25: advise, do not reject. But a fullwidth colon must still be SEEN.
     fn: () => CLAUDE_WIDE_COLON, ok: r => (r.advisories || []).some(a => /contains "P0:"/.test(a)) },
@@ -287,6 +297,20 @@ const CASES_B = [
   // ==== ⑤ claim fixtures + ⑥ claim gate ====
   { n: 'B23 claim mode converges on a clean anchored round', args: { ...B_BIO, prior_state: R1bio.prior_state, codex_prev_verdict_raw: cxClaimA(R1bio.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAIM_A, ok: r => r.converged === true && r.convergence_status === 'converged' && (r.blockers || []).length === 0 && r.needs_expert_signoff === false },
   // B24: a Claude verdict whose ANCHOR is not "anchored" must be blocked by the claim gate.
+  // B24b: the ESCALATION itself, not just the block. An independent sweep found that replacing
+  // `const needsSignoff = gate.claimGap` with `false` left the whole release gate green: every
+  // assertion that touched the field checked `=== false` on fixtures where claimGap is structurally
+  // false, so that conjunct could never go false (shape 8 - satisfied vacuously). The escalation for
+  // unanchored biological claims is a load-bearing path on this machine: it is how a claim that
+  // cannot be anchored reaches a human instead of being reported as an ordinary non-convergence.
+  // This case pins that the panel RAISES it, and the mutant is the exact deletion that went unnoticed.
+  { n: 'B24b unanchored claims at the round cap RAISE the expert sign-off escalation',
+    args: { ...B_BIO_Q, prior_state: R1bioUnQ.prior_state, codex_prev_verdict_raw: cxClaimA(R1bioUnQ.task_fingerprint + '_r1'), codex_exit_code: 0 },
+    fn: () => CLAIM_UN,
+    ok: r => r.needs_expert_signoff === true && r.audit_stage === 'escalate_to_user' &&
+             (r.unanchored_biology_claims || []).length > 0 && (r.unanchored_claims || []).length > 0 &&
+             /EXPERT SIGN-OFF/.test(String(r.recommended_next_action || '')),
+    g: 'const needsSignoff = gate.claimGap', gf: 'const needsSignoff = false' },
   { n: 'B24 an unanchored claim is blocked by the claim gate', args: { ...B_BIO, prior_state: R1bioUn.prior_state, codex_prev_verdict_raw: cxClaimA(R1bioUn.task_fingerprint + '_r1'), codex_exit_code: 0 }, fn: () => CLAIM_UN, ok: r => r.converged === false && r.convergence_status === 'r2_handoff_to_codex', g: "if (claimGap) blockers.push('substantive claims not fully anchored", gf: "if (false) blockers.push('substantive claims not fully anchored" },
 ]
 

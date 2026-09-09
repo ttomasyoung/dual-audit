@@ -33,7 +33,16 @@ export "${EP}_RUNTIME_DIR=$TESTDIR"
 export "${EP}_TELEMETRY="
 trap 'rm -rf "$TESTDIR"' EXIT
 
-pass=0; fail=0
+pass=0; fail=0; skip=0
+# 🔴 SKIPs are COUNTED and reported. A skipped case is honest, but "27 passed / 0 failed" reads as full
+# coverage to anyone checking the release gate, and two load-bearing cases skip routinely: the
+# launch-marker group when this environment cannot reach a reviewer, and the post-lock budget case
+# when the build under test pins its lock to a fixed global path (which the deployed build does, so
+# that assertion has never run against it here). An independent sweep found both, shape 5.
+# The exit status is deliberately NOT changed: a skip is not a failure, and making it one would turn
+# the live-parity run red for a difference that is already recorded and accepted. What changes is that
+# the number is now impossible to miss.
+skipped() { skip=$((skip+1)); echo "  SKIP  $1"; }
 want() { # want <expected-rc> <description> <command...>
   local exp="$1" desc="$2"; shift 2
   local out rc
@@ -202,7 +211,7 @@ else fail=$((fail+1)); echo "  FAIL rc=$src want=97  the serial path never reach
 MUT="$TESTDIR/mutant-wrapper"
 sed -E 's/^([[:space:]]*)_clamp_timeout .*$/\1: # mutated away/' "$W" > "$MUT" && chmod +x "$MUT"
 if [ "$CAN_LAUNCH" != 1 ]; then
-  echo "  SKIP  [mut] the teeth check needs to REACH the reviewer, which this environment cannot do"
+  skipped "[mut] the teeth check needs to REACH the reviewer, which this environment cannot do"
 elif [ "$brc" != 97 ]; then
   fail=$((fail+1)); echo "  FAIL [mut] skipped: the unmutated run never reached 97, so nothing here can prove the guard has teeth"
 elif ! grep -qE '^[[:space:]]*: # mutated away' "$MUT"; then
@@ -230,6 +239,68 @@ else
   : > "$STUB_LOG"   # the mutant's launch is accounted for; later cases start from zero again
 fi
 
+echo "=== The caller's ceiling is modelled, not assumed ==="
+# The Bash tool of the harness that usually calls this wrapper caps one call at max(BASH_MAX_TIMEOUT_MS,
+# 120000) ms — 600000 while that variable is unset (read from the CLI binary, not from documentation).
+# A declared outer budget above that cap is a promise the caller cannot keep: the run would start and be
+# killed into silence. So the wrapper must refuse such a budget BEFORE dispatch — but only when the
+# caller IS that harness (it exports CLAUDECODE=1); a terminal or cron caller has no cap, and a
+# legitimate long review from there must go through.
+# The launch counter is the observable: a refusal reaches the stub ZERO times, a pass reaches it once.
+cap_case() { # cap_case <refuse|launch> <description> <env assignments / -u names ...>
+  local exp="$1" desc="$2"; shift 2
+  local before after rc=0
+  before=$(wc -l < "$STUB_LOG")
+  printf 'review this\n' | env "$@" "$W" "${OKARGS[@]}" >/dev/null 2>&1 || rc=$?
+  after=$(wc -l < "$STUB_LOG")
+  if [ "$exp" = refuse ]; then
+    if [ "$rc" = 8 ] && [ "$after" = "$before" ]; then pass=$((pass+1)); echo "  PASS rc=8   $desc"
+    else fail=$((fail+1)); echo "  FAIL rc=$rc want=8 launches $before->$after  $desc"; fi
+  else
+    if [ "$CAN_LAUNCH" != 1 ]; then skipped "$desc (this environment cannot reach a reviewer launch)"; return 0; fi
+    if [ "$rc" != 8 ] && [ "$after" = $((before + 1)) ]; then pass=$((pass+1)); echo "  PASS rc=$rc   $desc"
+    else fail=$((fail+1)); echo "  FAIL rc=$rc launches $before->$after  $desc"; fi
+  fi
+}
+cap_case refuse 'under the harness with both variables unset, a budget above 600000 ms is refused before dispatch' \
+  -u BASH_MAX_TIMEOUT_MS -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 "${EP}_OUTER_BUDGET=2460"
+cap_case refuse 'under the harness, a budget above a raised-but-still-too-small cap is refused' \
+  -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 BASH_MAX_TIMEOUT_MS=1800000 "${EP}_OUTER_BUDGET=2460"
+cap_case refuse 'a cap value the binary would ignore (not a plain integer) counts as unset' \
+  -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 BASH_MAX_TIMEOUT_MS=3600000.0 "${EP}_OUTER_BUDGET=2460"
+# The harness variable is tested for non-empty: a review showed CLAUDECODE=true slipping past an exact '= 1'.
+cap_case refuse 'the harness marker is any non-empty value, not exactly 1 (CLAUDECODE=true still guards)' \
+  -u BASH_MAX_TIMEOUT_MS -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=true "${EP}_OUTER_BUDGET=2460"
+# The binary folds BASH_DEFAULT_TIMEOUT_MS into the cap as well: cap = max(MAX, DEFAULT).
+cap_case refuse 'a raised DEFAULT that is still below the budget does not open the gate' \
+  -u BASH_MAX_TIMEOUT_MS CLAUDECODE=1 BASH_DEFAULT_TIMEOUT_MS=650000 "${EP}_OUTER_BUDGET=2460"
+cap_case launch 'a raised DEFAULT alone (MAX unset) raises the cap exactly as the binary does' \
+  -u BASH_MAX_TIMEOUT_MS CLAUDECODE=1 BASH_DEFAULT_TIMEOUT_MS=2500000 "${EP}_OUTER_BUDGET=2460"
+cap_case launch 'under the harness with the cap raised far enough, the same budget goes through to the reviewer' \
+  -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 BASH_MAX_TIMEOUT_MS=3600000 "${EP}_OUTER_BUDGET=2460"
+cap_case launch 'the default budget under the harness with both variables unset goes through (600000 <= 600000)' \
+  -u BASH_MAX_TIMEOUT_MS -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1
+cap_case launch 'outside the harness (no CLAUDECODE) there is no cap, so a long budget goes through' \
+  -u CLAUDECODE -u BASH_MAX_TIMEOUT_MS -u BASH_DEFAULT_TIMEOUT_MS "${EP}_OUTER_BUDGET=2460"
+# Teeth: with the guard removed, the over-cap run must REACH the reviewer — the same observable as above.
+CAPMUT="$TESTDIR/mutant-cap"
+sed -E 's/^if \[ -n "\$\{CLAUDECODE:-\}" \]; then$/if false; then/' "$W" > "$CAPMUT" && chmod +x "$CAPMUT"
+if [ "$CAN_LAUNCH" != 1 ]; then
+  skipped "[mut] the teeth check needs to REACH the reviewer, which this environment cannot do"
+elif ! grep -q '^if false; then$' "$CAPMUT"; then
+  fail=$((fail+1)); echo "  FAIL the cap-guard mutation anchor did not match — the mutant is a no-op, so this proves nothing"
+else
+  before=$(wc -l < "$STUB_LOG"); mrc=0
+  printf 'review this\n' | env -u BASH_MAX_TIMEOUT_MS -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 "${EP}_OUTER_BUDGET=2460" "$CAPMUT" "${OKARGS[@]}" >/dev/null 2>&1 || mrc=$?
+  after=$(wc -l < "$STUB_LOG")
+  if [ "$mrc" != 8 ] && [ "$after" = $((before + 1)) ]; then
+    pass=$((pass+1)); echo "  PASS rc=$mrc  [mut] with the cap guard removed the over-cap run REACHES the reviewer (the guard was the only thing stopping it)"
+  else
+    fail=$((fail+1)); echo "  FAIL rc=$mrc launches $before->$after  [mut] the mutant was stopped by something else, so this proves nothing"
+  fi
+fi
+: > "$STUB_LOG"   # every launch above is accounted for; later cases start from zero again
+
 echo "=== The wait for the serial lock counts against the budget too ==="
 # The gap a reviewer measured: the budget was checked BEFORE the lock wait and never again, so a run
 # could wait out most of the caller's ceiling and then launch a full-length reviewer against what was
@@ -252,7 +323,7 @@ case "$LOCKPATH" in
     # Not a pass: a build whose lock lives at a fixed global path cannot be exercised here without
     # contending with real runs on this machine, and pretending otherwise would be a green light
     # bought by not looking.
-    echo "  SKIP  lock path '$LOCKPATH' is outside the throwaway dir; refusing to contend with real runs"
+    skipped "lock path '$LOCKPATH' is outside the throwaway dir; refusing to contend with real runs"
     ;;
 esac
 
@@ -309,7 +380,7 @@ echo "=== A run killed from OUTSIDE must not look like a run that never started 
 # builds name their markers differently (..._RC / ..._LAUNCHED share a prefix), and a suite that
 # hardcodes one build's spelling silently stops testing the other.
 if [ "$CAN_LAUNCH" != 1 ]; then
-  echo "  SKIP  every case here must reach the launch point; this environment refuses during bootstrap"
+  skipped "every case here must reach the launch point; this environment refuses during bootstrap"
 else
 LAUNCH_MARK="__${RCM%_RC}_LAUNCHED="
 printf '#!/bin/sh\necho "LAUNCH $*" >> "%s"\nsleep 30\n' "$STUB_LOG" > "$STUB_DIR/hang"
@@ -407,5 +478,9 @@ fi
 fi
 
 echo ""
-echo "=== RESULT: $pass passed / $fail failed ==="
+if [ "$skip" -gt 0 ]; then
+  echo "=== RESULT: $pass passed / $fail failed / $skip SKIPPED (not covered — see the SKIP lines above) ==="
+else
+  echo "=== RESULT: $pass passed / $fail failed ==="
+fi
 [ "$fail" -eq 0 ]

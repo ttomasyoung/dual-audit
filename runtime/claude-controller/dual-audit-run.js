@@ -227,6 +227,62 @@ for (const k of allReadableKeys(a)) {
   if (!HANDSHAKE_KEYS.includes(k)) panelArgs[k] = a[k]
 }
 
+// ── Long seat (the second lane) ──────────────────────────────────────────────
+// The Bash tool's 600000 ms is NOT a hard ceiling: the CLI computes max = max(BASH_MAX_TIMEOUT_MS,
+// default), so a machine that sets that variable in its settings env can hold a seat open longer.
+// A caller opts in with `codex_timeout_s` (seconds the reviewer may run). The driver then prefixes the
+// reviewer's task text with ONE machine-readable line; the forwarder reads its timeout and wrapper
+// budget from that line (see the agent definition). The panel is not touched, and without the key the
+// prompt handed to the forwarder is byte-identical to what it was before this lane existed.
+//
+// Budget arithmetic, defined ONCE here and mirrored by the tests:
+//   wrapper TIMEOUT = t      wrapper OUTER_BUDGET = t + 60      Bash timeout_ms = (t + 60) * 1000
+//   the wrapper keeps KILL_AFTER(30) + BUDGET_SLACK(10) out of the 60 s headroom, so its pre-steps
+//   (stdin snapshot, lock wait, credential write) may use 20 s before _clamp_timeout starts shortening
+//   t; either way the wrapper times out FIRST, at least BUDGET_SLACK before the harness, and stays loud.
+// 🔴 Whether THIS machine has raised the cap is not decided here: a workflow script cannot read the
+//    environment. The wrapper decides (under CLAUDECODE=1 a budget above BASH_MAX_TIMEOUT_MS is refused
+//    with rc=8 before anything starts), so a misconfigured lane fails loudly instead of being killed
+//    into an empty stdout.
+const SEAT_PARAMS_TOKEN = 'dual-audit:seat-params'
+const SEAT_ENV_PREFIX = 'DUAL_AUDIT'
+const DEFAULT_SEAT_S = 540    // the wrapper's own TIMEOUT default; test_agentdef.sh pins this to the wrapper's real value
+// 🔴 The smallest accepted request must EXCEED the default seat. A review found the gap: with t=600 and the
+//    old relative tolerance, a seat that ignored the line and ran the default 540 s read as applied, because
+//    floor(0.9*600) = 540. Below 600 the lane buys nothing anyway; at 600 and above the strict '> default'
+//    test below separates an applied long seat from an ignored line with no overlap.
+const LANE_MIN_S = 600
+const LANE_MAX_S = 86340      // the wrapper's own TIMEOUT ceiling (86400) minus the headroom below
+const LANE_HEADROOM_S = 60
+// The wrapper may trim TIMEOUT by what its own pre-steps consumed: stdin snapshot (<= 120 s), slot or lock
+// wait (<= 20 s), credential write (<= 30 s). An absolute allowance covers that mechanism at every t; a
+// percentage did not (too loose at large t, too tight at small t).
+const LANE_CLAMP_TOLERANCE_S = 200
+let seatTimeoutS = null
+// Present-or-absent, not truthy-or-falsy: a key that is there with null, '' or blanks is a malformed request
+// and is refused like any other bad value. Only a key that is ABSENT selects the default seat.
+const seatKeyPresent = allReadableKeys(a).includes('codex_timeout_s')
+if (seatKeyPresent) {
+  const raw = a.codex_timeout_s == null ? String(a.codex_timeout_s) : String(a.codex_timeout_s).trim()
+  const n = /^[1-9][0-9]{0,6}$/.test(raw) ? parseInt(raw, 10) : NaN
+  if (!Number.isInteger(n) || n < LANE_MIN_S || n > LANE_MAX_S) {
+    // Refused, never silently reduced to the default: a caller who asked for a long seat and got the
+    // short one would read a 540 s verdict as the long review it requested.
+    return {
+      converged: false, terminal_state: INVALID_AUDIT, rc_diagnostics: [],
+      error: `codex_timeout_s='${raw}' is not valid: an integer number of seconds between ${LANE_MIN_S} and ${LANE_MAX_S}`
+           + ' (omit the key entirely for the default 540 s seat; null, empty and blank count as malformed).'
+           + ' Refused rather than falling back to the default.',
+    }
+  }
+  seatTimeoutS = n
+  // The panel fingerprints every caller key; hand it the parsed integer, not the caller's spelling of it.
+  panelArgs.codex_timeout_s = n
+}
+const seatParamsLine = seatTimeoutS == null ? '' :
+  `<!-- ${SEAT_PARAMS_TOKEN} timeout_ms=${(seatTimeoutS + LANE_HEADROOM_S) * 1000}`
+  + ` env="${SEAT_ENV_PREFIX}_TIMEOUT=${seatTimeoutS} ${SEAT_ENV_PREFIX}_OUTER_BUDGET=${seatTimeoutS + LANE_HEADROOM_S}" -->`
+
 // ============================================================================
 // Exit-code extraction. THE ONLY SOURCE is the marker the wrapper writes INSIDE
 // the VERDICT..END block.
@@ -258,6 +314,8 @@ const BLOCK_RE = /^[ \t]*VERDICT:[\s\S]*?^[ \t]*END[ \t]*$/gm
 // killed part-way is DISTINGUISHABLE from one that never started. Without it both produced an
 // empty stdout, and no amount of care downstream can separate two identical signals.
 const LAUNCHED_RE = /^[ \t]*__DUAL_AUDIT_LAUNCHED=/m
+// Same marker, value captured: the seconds the wrapper actually granted the reviewer (long-seat check).
+const LAUNCHED_VALUE_RE = /^[ \t]*__DUAL_AUDIT_LAUNCHED=([0-9]+)[ \t]*$/gm   // /g: the LAST marker is read (a retried seat prints two)
 
 // Take the LAST VERDICT..END block (the panel picks the same one) and require
 // EXACTLY ONE marker inside it. Zero means the marker was dropped or the wrapper ran
@@ -370,7 +428,7 @@ while (calls < MAX_PANEL_CALLS) {
     // Do NOT add exit-code fields here. A model can report them consistently wrongly,
     // and two self-reported fields are not two sources. The only exit-code source is
     // rcInsideVerdictBlock above.
-    out = await agent(String(brief), {
+    out = await agent(seatParamsLine ? seatParamsLine + '\n' + String(brief) : String(brief), {
       agentType: 'dual-audit-codex-readonly',
       label: `codex-ro:call${calls}`,
       phase: 'Dual audit',
@@ -424,6 +482,25 @@ while (calls < MAX_PANEL_CALLS) {
     }
   }
   codexPrevRaw = verdictText
+  // Long seat: the wrapper announces the TIMEOUT it really granted (__DUAL_AUDIT_LAUNCHED=<s>) the instant it
+  // hands over control. Compare it with what was asked for, so a seat that ignored the seat-params line
+  // and ran on the default 540 s is SEEN rather than assumed. Diagnostic only, never a rewrite of the
+  // verdict: a complete verdict produced on the default budget is still a verdict, it just did not use
+  // the extra time. Two conditions, both required:
+  //   launched > DEFAULT_SEAT_S        — the default lane can never announce more than 540 (its TIMEOUT
+  //                                      defaults to 540 and clamping only lowers it), so this alone
+  //                                      separates an applied long seat from an ignored line;
+  //   launched >= t - CLAMP_TOLERANCE  — the wrapper trims by its pre-steps at most; a bigger shortfall
+  //                                      means the seat was not given what was asked.
+  // The marker read is the LAST one in the text: a seat that retried prints one per attempt.
+  if (seatTimeoutS != null) {
+    let lm, launched = null
+    LAUNCHED_VALUE_RE.lastIndex = 0
+    while ((lm = LAUNCHED_VALUE_RE.exec(String(verdictText))) !== null) launched = parseInt(lm[1], 10)
+    const applied = launched != null && launched > DEFAULT_SEAT_S && launched >= seatTimeoutS - LANE_CLAMP_TOLERANCE_S
+    trace.push({ call: calls, long_seat: { requested_s: seatTimeoutS, launched_s: launched, applied } })
+    if (!applied) log(`call${calls}: long seat NOT applied — asked for ${seatTimeoutS}s, wrapper announced ${launched == null ? 'no __DUAL_AUDIT_LAUNCHED line' : launched + 's'}; the verdict is forwarded as usual but the extra time was not used`)
+  }
 
   if (codexExitCode === null) {
     // Diagnostics must travel in the RETURN VALUE, not only in a log line. The first
@@ -487,6 +564,12 @@ while (calls < MAX_PANEL_CALLS) {
         ? 'a marker exists but is NOT inside any verdict block — most likely the wrapper did not take the --emit-rc injection path '
           + '(check: does the agent definition pass --emit-rc; did it fall back to serial mode; is the forwarder using an old command template)'
       : 'no marker inside or outside any block — the wrapper ran without --emit-rc, or the output was truncated by the forwarder'
+    // Long seat: a wrapper refusal BEFORE launch (rc=8: declared budget above the harness cap, or above the
+    // wrapper's own 86400 s ceiling) leaves no stdout and lands in these two codes. The refusal text names the
+    // numbers and is on stderr, which the forwarder appends only when no verdict came back.
+    const whyLane = (seatTimeoutS != null && (code === 'EMPTY_VERDICT_TEXT' || code === 'NO_BLOCK_NO_MARKER'))
+      ? why + ` [long seat ${seatTimeoutS}s was requested: a wrapper refusal before launch (rc=8, budget above the harness cap or the wrapper ceiling) looks exactly like this — read verdict_text_tail for the wrapper's own message]`
+      : why
     rcDiagnostics.push({
       call: calls, code, blocks: nBlocks,
       markers_in_last_block: inLast, markers_in_any_block: inAnyBlock,
@@ -497,7 +580,7 @@ while (calls < MAX_PANEL_CALLS) {
       // The evidence the classification rests on, so a reader can check it without opening journals.
       verdict_text_len: String(verdictText).length,
       verdict_text_tail: String(verdictText).slice(-160),
-      why: `call${calls}: ${why}`,
+      why: `call${calls}: ${whyLane}`,
     })
     log(`call${calls}: no __DUAL_AUDIT_RC inside the verdict block — not forwarded, so the panel will treat the reviewer as unavailable. Reason: ${why}`)
   }
