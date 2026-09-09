@@ -5,11 +5,34 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.3.1]
+
+**The cap model was stricter than the parser it models.** The wrapper reads `BASH_MAX_TIMEOUT_MS` to
+decide whether the caller can grant a declared budget, and required pure digits. The CLI it models
+does `String(e).trim()` then `N(n) ?? parseInt(n, 10)`, so `3600000.0` and `" 3600000 "` are honoured
+there and were read here as unset — a budget the caller could actually grant, refused with exit 8.
+The direction was safe (a loud over-refusal, never a silent kill) but the model was wrong, and a test
+asserted the wrong model as correct. It now follows the same trim-then-leading-integer rule, and
+deliberately keeps parseInt semantics where they disagree with Number (`3.6e6` reads as 3, not
+3600000): under-reading the cap over-refuses and says so, over-reading it gets a run killed in silence.
+
+**The skip count under-reported what was not covered.** 1.3.0 began counting skipped cases, but it
+counted skip STATEMENTS: one line stands for the whole launch-marker group, so a run with no
+credentials reported nine skips while fourteen cases had not run. A skip may now declare how many
+cases it covers, and the suite checks that passed + failed + skipped equals its own case total —
+so an under-report fails loudly instead of reading as coverage. That check also fires when a case is
+added, which is exactly when the totals need revisiting.
+
+**Corrections to the 1.3.0 note above.** It said three assertions "could not fail" and described
+two; the third could fail and was mis-NAMED, which is a different defect, and it is now stated as
+such. It also described a refused state as "carrying findings inherited" from it — the field that
+sentence had in mind is not one the panel emits on that path, and the test fixture that carried it
+has been corrected to the shape the panel really produces.
+
 ## [1.3.0]
 
-**Three assertions in this suite could not fail.** A sweep that asked, of every assertion, "would
-this fail if the thing it pins were broken?" found that the answer was no for three of them — and two
-were on load-bearing paths. Replacing the expert-sign-off escalation with a constant `false` left the
+**Two assertions in this suite could not fail, and a third promised more than it checked.** A sweep
+asked, of every assertion, "would this fail if the thing it pins were broken?" Replacing the expert-sign-off escalation with a constant `false` left the
 entire release gate green: every assertion that touched the field checked `=== false` on fixtures where
 the claim gate is structurally false, so that conjunct could never go false. Nothing anywhere pinned
 that the panel ever RAISES the flag, which is the path by which a claim that cannot be anchored reaches
@@ -18,9 +41,16 @@ statuses from the driver's `INVALID_STATUSES` also left everything green, becaus
 omitted the `audit_stage` the panel really emits and was therefore classified by the trailing
 fail-closed default instead — it passed for a reason other than the one it names, so against a real
 panel result the same deletion turns a refused, never-adjudicated state into what reads as substantive
-reviewer disagreement, carrying findings inherited from the state that was just refused. Both now have
-a case built on the shape the panel actually produces, and the exact mutation that went unnoticed is
-pinned as its mutant.
+reviewer disagreement rather than as a state the panel declined to merge. Both now have a case built
+on the shape the panel actually produces, and the exact mutation that went unnoticed is pinned as its
+mutant.
+
+The third was a name, not an assertion: a case called "a blocker hidden inside another field value
+cannot converge" asserts only that an advisory fires, and the panel deliberately lets that round
+converge — a calibration against 470 real verdicts, where a hard gate added thirteen rejections and
+no true positives. The assertion was doing its job; the name promised a gate that does not exist, so
+a reader of a green suite was told a guarantee was covered when it was not. Both that case and its
+full-width-colon sibling now say what they check.
 
 **A skipped case no longer reads as a covered one.** The wrapper suite skips its launch-marker group
 where the environment cannot reach a reviewer, and its post-lock budget case where the build under test

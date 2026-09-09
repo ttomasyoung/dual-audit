@@ -42,7 +42,11 @@ pass=0; fail=0; skip=0
 # The exit status is deliberately NOT changed: a skip is not a failure, and making it one would turn
 # the live-parity run red for a difference that is already recorded and accepted. What changes is that
 # the number is now impossible to miss.
-skipped() { skip=$((skip+1)); echo "  SKIP  $1"; }
+# $1 = message, $2 = how many CASES this one skip stands for (default 1). An independent review
+# measured the difference: with an empty HOME the suite printed 7 skips while 12 cases had not run,
+# because one SKIP line covers the whole launch-marker group. A count that under-reports what was not
+# covered is the same failure as not reporting it.
+skipped() { skip=$((skip + ${2:-1})); echo "  SKIP  $1${2:+  (covers $2 cases)}"; }
 want() { # want <expected-rc> <description> <command...>
   local exp="$1" desc="$2"; shift 2
   local out rc
@@ -266,8 +270,19 @@ cap_case refuse 'under the harness with both variables unset, a budget above 600
   -u BASH_MAX_TIMEOUT_MS -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 "${EP}_OUTER_BUDGET=2460"
 cap_case refuse 'under the harness, a budget above a raised-but-still-too-small cap is refused' \
   -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 BASH_MAX_TIMEOUT_MS=1800000 "${EP}_OUTER_BUDGET=2460"
-cap_case refuse 'a cap value the binary would ignore (not a plain integer) counts as unset' \
+# 🔴 The CLI trims and then falls back to parseInt, so the first two ARE honoured by it. Refusing them
+# was an over-refusal of a budget the caller could actually grant, and the previous version of this
+# case asserted that mistake as correct behaviour.
+cap_case launch 'a trailing .0 is honoured by the CLI parser, so it must not read as unset' \
   -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 BASH_MAX_TIMEOUT_MS=3600000.0 "${EP}_OUTER_BUDGET=2460"
+cap_case launch 'surrounding whitespace is trimmed, as the CLI trims it' \
+  -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 "BASH_MAX_TIMEOUT_MS= 3600000 " "${EP}_OUTER_BUDGET=2460"
+cap_case refuse 'a value with no leading digits is ignored by the CLI too, so the cap stays at its default' \
+  -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 BASH_MAX_TIMEOUT_MS=abc "${EP}_OUTER_BUDGET=2460"
+# Where parseInt and Number disagree the model takes the SMALLER answer on purpose: 1 and 3, not
+# 1800000 and 3600000. Under-reading the cap over-refuses loudly; over-reading it gets a run killed silently.
+cap_case refuse 'a thousands-separated value reads as its leading digits, the fail-closed answer' \
+  -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=1 BASH_MAX_TIMEOUT_MS=1,800,000 "${EP}_OUTER_BUDGET=2460"
 # The harness variable is tested for non-empty: a review showed CLAUDECODE=true slipping past an exact '= 1'.
 cap_case refuse 'the harness marker is any non-empty value, not exactly 1 (CLAUDECODE=true still guards)' \
   -u BASH_MAX_TIMEOUT_MS -u BASH_DEFAULT_TIMEOUT_MS CLAUDECODE=true "${EP}_OUTER_BUDGET=2460"
@@ -380,7 +395,7 @@ echo "=== A run killed from OUTSIDE must not look like a run that never started 
 # builds name their markers differently (..._RC / ..._LAUNCHED share a prefix), and a suite that
 # hardcodes one build's spelling silently stops testing the other.
 if [ "$CAN_LAUNCH" != 1 ]; then
-  skipped "every case here must reach the launch point; this environment refuses during bootstrap"
+  skipped "every case here must reach the launch point; this environment refuses during bootstrap" 6
 else
 LAUNCH_MARK="__${RCM%_RC}_LAUNCHED="
 printf '#!/bin/sh\necho "LAUNCH $*" >> "%s"\nsleep 30\n' "$STUB_LOG" > "$STUB_DIR/hang"
@@ -478,6 +493,18 @@ fi
 fi
 
 echo ""
+# 🔴 The accounting must ADD UP, or a skip count is just another number nobody can check. Measured:
+# a full run covers TOTAL_CASES; with no credentials 33 ran and 9 skips were reported while 14 cases
+# had not run, because one SKIP line stood for six. This check makes that drift impossible to miss —
+# and it goes red when a case is ADDED too, which is the moment the totals need updating anyway.
+TOTAL_CASES=47
+accounted=$((pass + fail + skip))
+if [ "$accounted" -ne "$TOTAL_CASES" ]; then
+  fail=$((fail+1))
+  echo "  FAIL case accounting: $pass passed + $fail failed + $skip skipped = $accounted, but this suite has $TOTAL_CASES cases."
+  echo "        Either a skip is standing for more cases than it counts (pass a count as its second argument),"
+        echo "        or cases were added/removed and TOTAL_CASES needs updating."
+fi
 if [ "$skip" -gt 0 ]; then
   echo "=== RESULT: $pass passed / $fail failed / $skip SKIPPED (not covered — see the SKIP lines above) ==="
 else

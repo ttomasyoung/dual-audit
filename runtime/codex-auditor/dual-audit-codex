@@ -196,8 +196,22 @@ _numenv OUTER_BUDGET  DUAL_AUDIT_OUTER_BUDGET  600   604800
 # The harness variable is tested for non-empty, not for a particular value: the guard must not go quiet
 # if the harness ever spells it differently.
 if [ -n "${CLAUDECODE:-}" ]; then
-  _cap_int(){ # $1=raw value -> the integer the binary would use, or '' when it would ignore the value
-    case "${1:-}" in ''|*[!0-9]*) echo '' ;; *) if [ "${#1}" -le 18 ] && [ "$((10#$1))" -gt 0 ]; then echo "$((10#$1))"; else echo ''; fi ;; esac; }   # 18 digits: inside the shell's 64-bit range; beyond that the value is absurd and counts as unset
+  # $1=raw value -> the integer the caller's CLI would use, or '' when it would ignore the value.
+  # 🔴 Modelled on the CLI's own parser, which is `String(e).trim()` then `N(n) ?? parseInt(n, 10)`.
+  #    An earlier version here demanded pure digits, so `3600000.0` and `" 3600000 "` — both HONOURED by
+  #    the CLI — were read as unset and a budget it would have granted was refused with rc=8. The
+  #    direction was safe (a loud over-refusal, never a silent kill) but the model was wrong, and a test
+  #    pinned the wrong model as correct.
+  # ⚠️ Deliberately keeps parseInt's LEADING-INTEGER semantics rather than Number's: where the two
+  #    disagree (`3.6e6` -> 3 vs 3600000) the smaller answer is the fail-closed one. Under-reading the
+  #    cap over-refuses and says so; over-reading it lets a run start that the caller will kill in silence.
+  _cap_int(){
+    local _v="${1:-}"
+    _v="${_v#"${_v%%[![:space:]]*}"}"; _v="${_v%"${_v##*[![:space:]]}"}"   # trim, as the CLI does
+    _v="${_v#+}"
+    local _d="${_v%%[!0-9]*}"                                              # leading digits, as parseInt does
+    if [ -z "$_d" ] || [ "${#_d}" -gt 18 ]; then echo ''; return; fi       # 18 digits stays inside the shell's 64-bit range
+    if [ "$((10#$_d))" -gt 0 ]; then echo "$((10#$_d))"; else echo ''; fi; }
   _dflt_ms=$(_cap_int "${BASH_DEFAULT_TIMEOUT_MS:-}"); [ -n "$_dflt_ms" ] || _dflt_ms=120000
   _max_ms=$(_cap_int "${BASH_MAX_TIMEOUT_MS:-}");     [ -n "$_max_ms" ]  || _max_ms=600000
   _cap_ms=$(( _max_ms > _dflt_ms ? _max_ms : _dflt_ms ))
