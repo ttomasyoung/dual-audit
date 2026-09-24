@@ -30,6 +30,13 @@ TESTDIR="$(mktemp -d "${TMPDIR:-/tmp}/dual-audit-test.XXXXXX")" || exit 2
 # honoured no matter which build is being exercised. Getting this wrong would not fail loudly — it
 # would quietly write into the user's real runtime directory.
 export "${EP}_RUNTIME_DIR=$TESTDIR"
+# The wrapper resolves its reviewer model from a models cache and refuses (96) without one. The suite
+# must not depend on the machine it runs on having that cache — a clean CI runner has none, and every
+# case that expects a later guard (97, 9, 8 ...) would meet 96 first. So the whole file points the
+# wrapper at a fixture; the model cases below override it per call.
+printf '{"models":[{"slug":"gpt-6-sol","visibility":"list","supported_reasoning_levels":[{"effort":"high"}]}]}' \
+  > "$TESTDIR/default-models-cache.json"
+export "${EP}_MODELS_CACHE=$TESTDIR/default-models-cache.json"
 export "${EP}_TELEMETRY="
 trap 'rm -rf "$TESTDIR"' EXIT
 
