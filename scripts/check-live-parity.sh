@@ -156,7 +156,7 @@ run "panel"   env DUAL_AUDIT_PANEL="$LIVE_PANEL" node "$REPO/tests/test_panel.mj
 # The seat attempt ledger lives in the PROMPT, so only a suite that reads what the deployed panel
 # actually emits can tell whether it is still there. Same reason the panel suite runs against live.
 run "attempt ledger" env DUAL_AUDIT_PANEL="$LIVE_PANEL" node "$REPO/tests/test_seat_attempt_ledger.mjs"
-run "driver"  env DUAL_AUDIT_DRIVER="$LIVE_DRIVER" DUAL_AUDIT_RC_MARKER="__$LIVE_RC" DUAL_AUDIT_ENVP="$LIVE_ENVP" node "$REPO/tests/test_driver.mjs"
+run "driver"  env DUAL_AUDIT_DRIVER="$LIVE_DRIVER" DUAL_AUDIT_WRAPPER="$LIVE_WRAPPER" DUAL_AUDIT_RC_MARKER="__$LIVE_RC" DUAL_AUDIT_ENVP="$LIVE_ENVP" node "$REPO/tests/test_driver.mjs"
 # The argument-size gate is checked against the deployed driver too. It was added to both
 # builds in one sitting, which is exactly when a gate is easiest to leave on only one side.
 run "args size" env DRIVER="$LIVE_DRIVER" node "$REPO/tests/test_args_size_gate.mjs"

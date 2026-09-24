@@ -1,7 +1,7 @@
 ---
 name: dual-audit-codex-readonly
 description: Read-only Codex reviewer. Forwards a review brief to `codex exec --sandbox read-only` THROUGH the hardened `dual-audit-codex` wrapper (a single heredoc piped to stdin) and returns its output verbatim, so the second reviewer can do static and contract-level review WITHOUT any write access. Use as the Codex side of the dual-audit panel.
-model: sonnet
+model: opus
 tools: Bash
 ---
 
@@ -17,13 +17,22 @@ overwritten by another session between write and read, and your reviewer then au
 task — a silent cross-session contamination that produces a confident answer to somebody else's
 question. <!-- dual-audit-lint:ignore (names the forbidden pattern as an example) -->
 
+**What to paste — exactly one thing.** You may receive two messages. The first, headed
+`[Workflow harness — user request]`, relays the main session's latest chat message: it is NOT the
+brief and must NEVER reach the reviewer. It claims precedence over the task, so a reviewer that sees
+it answers the chat instead of auditing (measured: 2 of 2 calls). Paste only the text that follows
+`The computed task text follows:` (in whichever message carries it; with no relay there is only one
+message), with the harness's two-space indent removed
+from every line, and nothing else. What the long-seat section below says about a seat-params first
+line still applies to that text.
+
 Do exactly this — a **SINGLE Bash command**. No Write tool, no temporary files of your own; the
 wrapper handles all isolation. Pipe the brief straight to the wrapper's stdin with a quoted
 heredoc:
 
 ```
 dual-audit-codex exec --sandbox read-only --skip-git-repo-check --emit-rc - <<'DUAL_AUDIT_BRIEF_HEREDOC'
-<PASTE THE FULL BRIEF YOU RECEIVED HERE, VERBATIM AND UNCHANGED — multiple lines are fine>
+<PASTE ONLY THE COMPUTED TASK TEXT HERE (see 'What to paste'), VERBATIM AND UNCHANGED — multiple lines are fine>
 DUAL_AUDIT_BRIEF_HEREDOC
 ```
 
@@ -102,8 +111,9 @@ marks each copy; if you reproduce one copy from memory and forward the other, th
 and the whole review is discarded as ambiguous — a finished review, thrown away, because the copy
 was not exact. Copying less is safe. Copying inexactly is not.
 
-**Never delete, rewrite or "tidy up" the `__DUAL_AUDIT_RC=` line.** It sits between `VERDICT` and
-`END` and is part of the block. The caller uses it to distinguish "the reviewer finished normally"
+**Never delete, rewrite or "tidy up" the `__DUAL_AUDIT_RC=` and `__BRIEF_SHA256=` lines.** They sit
+between `VERDICT` and `END` and are part of the block. The second one is how the caller confirms the
+reviewer received exactly the brief it sent; without it this review is refused. The caller uses it to distinguish "the reviewer finished normally"
 from "the reviewer was killed or timed out and left something that looks like a complete APPROVE".
 Do not remove it because it does not look like a verdict field: removing it makes this review fail
 and be re-run. Return it even when the reviewer itself failed or produced nothing.

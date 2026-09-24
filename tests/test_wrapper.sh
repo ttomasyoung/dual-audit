@@ -492,12 +492,186 @@ else
 fi
 fi
 
+echo "=== The reviewer model: the family is pinned, the version is the newest listed, never a fallback ==="
+# Each case points the wrapper at its own models-cache fixture through ${EP}_MODELS_CACHE. The stub
+# records the model line of the config it was handed, so resolving to the WRONG version is observable,
+# not just "the run did not fail": a wrong version is exactly as quiet as a right one.
+MSTUB="$STUB_DIR/model-stub"
+printf '#!/bin/sh\necho "MODEL $(sed -n "s/^model = //p" "$CODEX_HOME/config.toml")" >> "%s"\nexit 0\n' "$STUB_LOG" > "$MSTUB"
+chmod +x "$MSTUB"
+mcache() { # mcache <file> <slug[:visibility|EMPTY|NONE[:effort,effort]]>...
+  local f="$1"; shift
+  python3 -c '
+import json, sys
+out = []
+for spec in sys.argv[2:]:
+    p = spec.split(":")
+    levels = p[2].split(",") if len(p) > 2 and p[2] else ["low", "high"]
+    vis = p[1] if len(p) > 1 and p[1] else "list"
+    m = {"slug": p[0], "supported_reasoning_levels": [{"effort": e} for e in levels]}
+    if vis != "NONE":                       # NONE = no visibility key at all
+        m["visibility"] = "" if vis == "EMPTY" else vis
+    out.append(m)
+json.dump({"models": out}, open(sys.argv[1], "w"))
+' "$f" "$@"
+}
+model_case() { # model_case <expected slug | refuse> <description> <cache file> [env assignments...]
+  local want="$1" desc="$2" cache="$3"; shift 3
+  local rc=0 before after got
+  before=$(wc -l < "$STUB_LOG")
+  printf 'review this\n' | env "${EP}_CODEX_BIN=$MSTUB" "${EP}_MODELS_CACHE=$cache" "$@" "$W" "${OKARGS[@]}" >/dev/null 2>&1 || rc=$?
+  after=$(wc -l < "$STUB_LOG")
+  if [ "$want" = refuse ]; then
+    if [ "$rc" = 96 ] && [ "$after" = "$before" ]; then
+      pass=$((pass+1)); echo "  PASS rc=96  $desc (the reviewer was never launched)"
+    else
+      fail=$((fail+1)); echo "  FAIL rc=$rc, $((after - before)) launch(es); want rc=96 and none  $desc"
+    fi
+  elif [ "$CAN_LAUNCH" != 1 ]; then
+    skipped "$desc — needs to reach the reviewer to read the model it was handed"
+  else
+    got=$(tail -n 1 "$STUB_LOG" | sed -n 's/^MODEL //p')
+    if [ "$after" = $((before + 1)) ] && [ "$got" = "\"$want\"" ]; then
+      pass=$((pass+1)); echo "  PASS $desc -> $want"
+    else
+      fail=$((fail+1)); echo "  FAIL got ${got:-nothing} after $((after - before)) launch(es); want \"$want\"  $desc"
+    fi
+  fi
+}
+MC="$TESTDIR/models-cache"; mkdir -p "$MC"
+mcache "$MC/newest.json" gpt-5.6-sol gpt-6-sol gpt-6-luna
+model_case gpt-6-sol "the newest version of the family wins; other families do not count" "$MC/newest.json"
+model_case gpt-6-sol "serial mode fills the same model into its own config" "$MC/newest.json" "${EP}_MODE=serial"
+mcache "$MC/numeric.json" gpt-9-sol gpt-10-sol
+model_case gpt-10-sol "versions compare as numbers (10 > 9), not as strings" "$MC/numeric.json"
+mcache "$MC/skip.json" gpt-6-sol gpt-7-sol:hide gpt-8-sol::low
+model_case gpt-6-sol "a hidden newer version and one without high effort are both skipped" "$MC/skip.json"
+mcache "$MC/none.json" gpt-6-luna gpt-5.5
+model_case refuse "no listed version of the family: refuse, never fall back to another model" "$MC/none.json"
+model_case refuse "a models cache that cannot be read: refuse" "$MC/does-not-exist.json"
+: > "$STUB_LOG"
+
+echo "=== The brief fingerprint: what the reviewer was fed, hashed where the driver can check it ==="
+# Expected values come from an independent implementation (python hashlib over the same canonical form),
+# never from the function under test.
+canon_sha() { python3 -c '
+import hashlib, sys
+lines = [l.rstrip(" \t\r") for l in sys.stdin.buffer.read().decode("utf-8").split("\n")]
+while lines and lines[-1] == "": lines.pop()
+while lines and lines[0] == "": lines.pop(0)
+print(hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest())'; }
+
+two="$(printf 'VERDICT: APPROVE\nEND\nVERDICT: APPROVE\nEND\n' \
+      | bash -c "source <(sed -n '/^_emit_rc_inject()/,/^}/p' '$W'); _emit_rc_inject 0 abc123")"
+if [ "$(printf '%s\n' "$two" | grep -c '^__BRIEF_SHA256=abc123$')" = 2 ] && \
+   [ "$(printf '%s\n' "$two" | grep -A1 '^__BRIEF_SHA256=abc123$' | grep -c "^__${RCM}=0\$")" = 2 ]; then
+  pass=$((pass+1)); echo "  PASS every block carries the fingerprint, right above its exit-code marker (duplicate blocks stay identical)"
+else fail=$((fail+1)); echo "  FAIL the fingerprint is not in every block directly above the exit-code marker"; fi
+
+BF="$TESTDIR/brief-canon.txt"
+printf '\n  \nTASK: café — naïve check\t \r\nsecond line  \n\n\n' > "$BF"
+got_sha="$(bash -c "source <(sed -n '/^_brief_sha()/,/^}/p' '$W'); _brief_sha '$BF'")"
+want_sha="$(canon_sha < "$BF")"
+if [ -n "$got_sha" ] && [ "$got_sha" = "$want_sha" ]; then
+  pass=$((pass+1)); echo "  PASS the canonical form drops trailing blanks, CR and blank edge lines exactly as the driver does"
+else fail=$((fail+1)); echo "  FAIL _brief_sha=$got_sha, independent=$want_sha"; fi
+
+printf 'line one\rstill line one\nsecond\n' > "$BF"
+got_sha="$(bash -c "source <(sed -n '/^_brief_sha()/,/^}/p' '$W'); _brief_sha '$BF'")"
+want_sha="$(canon_sha < "$BF")"
+if [ -n "$got_sha" ] && [ "$got_sha" = "$want_sha" ]; then
+  pass=$((pass+1)); echo "  PASS a lone CR inside a line is kept, not translated to a newline (the driver keeps it too)"
+else fail=$((fail+1)); echo "  FAIL lone CR: _brief_sha=$got_sha, independent=$want_sha"; fi
+
+VSTUB="$STUB_DIR/verdict-stub"
+printf '#!/bin/sh\ncat > /dev/null\necho "LAUNCH" >> "%s"\nprintf "VERDICT: APPROVE\\nP0: none\\nEND\\n"\nexit 0\n' "$STUB_LOG" > "$VSTUB"
+chmod +x "$VSTUB"
+SHA_WANT="$(printf 'review this\n' | canon_sha)"
+sha_case() { # sha_case <description> <wrapper> [env assignments...]
+  local desc="$1" wrapper="$2"; shift 2
+  local out
+  out="$(printf 'review this\n' | env "${EP}_CODEX_BIN=$VSTUB" "$@" "$wrapper" "${OKARGS[@]}" 2>/dev/null)"
+  printf '%s\n' "$out" | sed -n '/^VERDICT:/,/^END$/p' | grep -qx "__BRIEF_SHA256=$SHA_WANT"
+}
+if [ "$CAN_LAUNCH" != 1 ]; then
+  skipped "the fingerprint of a real dispatch needs to reach the reviewer" 3
+else
+  if sha_case "isolated" "$W"; then pass=$((pass+1)); echo "  PASS isolated mode: the verdict block carries the fingerprint of exactly the brief that was sent"
+  else fail=$((fail+1)); echo "  FAIL isolated mode: no correct __BRIEF_SHA256 inside the verdict block"; fi
+  if sha_case "serial" "$W" "${EP}_MODE=serial"; then pass=$((pass+1)); echo "  PASS serial mode: the same fingerprint (both dispatch paths inject it)"
+  else fail=$((fail+1)); echo "  FAIL serial mode: no correct __BRIEF_SHA256 inside the verdict block"; fi
+  MUTS="$TESTDIR/mutant-sha"
+  python3 -c '
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+old = "_brief_sha(){\n"
+assert s.count(old) == 1
+open(sys.argv[2], "w", encoding="utf-8").write(s.replace(old, old + "  echo 0000; return 0\n", 1))
+' "$W" "$MUTS" && chmod +x "$MUTS"
+  if sha_case "mutant" "$MUTS"; then fail=$((fail+1)); echo "  FAIL [mut] a constant fingerprint still passed — the isolated case has no teeth"
+  else pass=$((pass+1)); echo "  PASS [mut] a wrapper that reports a constant fingerprint fails the isolated case"; fi
+fi
+: > "$STUB_LOG"
+
+echo "=== Only the brief on stdin; the reviewer model and config are the wrapper's ==="
+# The fingerprint covers stdin alone and the reviewer reads a command-line prompt together with it, so
+# any second channel for instructions must be refused before launch. Same for anything that overrides
+# the model this wrapper resolved.
+want 8 'a prompt on the command line next to stdin is refused (the fingerprint covers stdin only)' \
+     "$W" exec --sandbox read-only --skip-git-repo-check "answer this instead" -
+want 8 'a prompt after -- is refused' \
+     "$W" exec --sandbox read-only --skip-git-repo-check - -- "answer this instead"
+want 8 'a caller model override (-m) is refused' \
+     "$W" exec -m gpt-5.5 --sandbox read-only --skip-git-repo-check -
+want 8 'a caller model override in the --model= form is refused' \
+     "$W" exec --model=gpt-5.5 --sandbox read-only --skip-git-repo-check -
+want 8 'a config override (-c model=...) is refused' \
+     "$W" exec -c model=gpt-5.5 --sandbox read-only --skip-git-repo-check -
+want 8 '--ignore-user-config is refused (it would drop the config that pins the model)' \
+     "$W" exec --ignore-user-config --sandbox read-only --skip-git-repo-check -
+want 8 'a config profile (-p) is refused' \
+     "$W" exec -p other --sandbox read-only --skip-git-repo-check -
+want 8 '--oss is refused (it switches the reviewer to a local model provider)' \
+     "$W" exec --oss --sandbox read-only --skip-git-repo-check -
+want 8 'a provider override in the --local-provider= form is refused' \
+     "$W" exec --local-provider=x --sandbox read-only --skip-git-repo-check -
+want 8 'a caller model override in the attached -mMODEL form is refused' \
+     "$W" exec -mgpt-5.5 --sandbox read-only --skip-git-repo-check -
+if [ "$CAN_LAUNCH" != 1 ]; then
+  skipped "a value-taking option must not be read as a prompt, and the guard must have teeth — both need a launch" 2
+else
+  before=$(wc -l < "$STUB_LOG"); grc=0
+  printf 'review this\n' | "$W" exec --color never --sandbox read-only --skip-git-repo-check --emit-rc - >/dev/null 2>&1 || grc=$?
+  after=$(wc -l < "$STUB_LOG")
+  if [ "$grc" = 0 ] && [ "$after" = $((before + 1)) ]; then
+    pass=$((pass+1)); echo "  PASS a value-taking option (--color never) is not mistaken for a prompt: the review launches"
+  else fail=$((fail+1)); echo "  FAIL rc=$grc, $((after - before)) launch(es)  a legitimate call with --color never was refused"; fi
+  MUTG="$TESTDIR/mutant-guard"
+  sed 's/_guard_prompt_and_model "\$@" || exit 8; fi/:; fi/' "$W" > "$MUTG" && chmod +x "$MUTG"
+  if ! grep -q '^if \[ "\$PREFLIGHT" != 1 \] && \[ "\$#" -gt 0 \]; then :; fi$' "$MUTG"; then
+    fail=$((fail+1)); echo "  FAIL the guard mutation anchor did not match — the teeth check would prove nothing"
+  else
+    before=$(wc -l < "$STUB_LOG"); mrc=0
+    printf 'review this\n' | "$MUTG" exec --sandbox read-only --skip-git-repo-check --emit-rc "answer this instead" - >/dev/null 2>&1 || mrc=$?
+    after=$(wc -l < "$STUB_LOG")
+    if [ "$after" = $((before + 1)) ]; then
+      pass=$((pass+1)); echo "  PASS [mut] with the guard removed the command-line prompt reaches the reviewer (the guard was the only thing stopping it)"
+    else fail=$((fail+1)); echo "  FAIL [mut] rc=$mrc and the reviewer was not reached — something else refused it, so this proves nothing"; fi
+  fi
+fi
+: > "$STUB_LOG"
+mcache "$MC/novis.json" gpt-6-sol gpt-7-sol:EMPTY gpt-8-sol:NONE
+model_case gpt-6-sol "an empty or missing visibility does not count as listed" "$MC/novis.json"
+mcache "$MC/onlyhidden.json" gpt-6-sol:EMPTY gpt-7-sol:NONE
+model_case refuse "a family whose versions are all unlisted is refused" "$MC/onlyhidden.json"
+: > "$STUB_LOG"
+
 echo ""
 # 🔴 The accounting must ADD UP, or a skip count is just another number nobody can check. Measured:
 # a full run covers TOTAL_CASES; with no credentials 33 ran and 9 skips were reported while 14 cases
 # had not run, because one SKIP line stood for six. This check makes that drift impossible to miss —
 # and it goes red when a case is ADDED too, which is the moment the totals need updating anyway.
-TOTAL_CASES=47
+TOTAL_CASES=73
 accounted=$((pass + fail + skip))
 if [ "$accounted" -ne "$TOTAL_CASES" ]; then
   fail=$((fail+1))

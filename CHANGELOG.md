@@ -5,6 +5,53 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.4.0]
+
+**Every seat now pins a model family and takes its newest version: the Claude seats by alias, the
+Codex reviewer from the models cache.**
+
+- **Claude auditor seats → `opus`.** They carried no model, so each seat silently became whatever
+  model the calling session happened to run: start a review from a session on a lighter model and
+  the audit ran on that model, with nothing in the output to say so.
+- **Codex forwarder: `opus`, now named where it is dispatched.** The forwarder hands the brief to
+  Codex and returns the verdict. The driver used to leave its model to the agent definition's
+  frontmatter; in a measured run, after the frontmatter was edited mid-session, the seat still ran
+  the calling session's model, so the driver now passes `opus` itself. The panel's forward-mode
+  branch, which cannot run on this build, says `opus` too. **Not a cheaper tier:** in testing a
+  `haiku` forwarder never invoked the wrapper in 2 of 2 calls — it reviewed the brief itself and
+  returned its own verdict in the reviewer's place — and `sonnet` forwarders leaked the relayed
+  request described next in 2 of the 3 calls where it was present.
+- **The reviewer's input is checked against the brief the driver sent.** Recent Claude Code versions
+  often put a `[Workflow harness — user request]` message in front of a workflow subagent; it relays
+  the main session's latest chat message and says it overrides the task. A forwarder that pasted it
+  along with the brief gave the reviewer the user's chat, and the reviewer answered that instead of
+  auditing; only an instruction stood against it. Now the wrapper writes `__BRIEF_SHA256=<hex>`, the
+  fingerprint of the brief it fed the reviewer, into every verdict block on the line above the
+  exit-code marker, and the driver compares it with a fingerprint of the text it dispatched (the
+  same canonical form on both sides: trailing blanks and blank edge lines dropped, UTF-8, SHA-256).
+  A missing, duplicated or different fingerprint withholds the exit code, so the panel refuses that
+  verdict exactly as it refuses one without an exit code, under its own diagnostic code
+  (`BRIEF_MISMATCH`, `BRIEF_SHA_MISSING`, `BRIEF_SHA_AMBIGUOUS`). Because the reviewer reads a
+  command-line prompt together with stdin while the fingerprint covers stdin alone, the wrapper also
+  refuses any prompt on the command line — a second positional argument, or anything after `--` —
+  with exit 8. **What this does not do:** it catches a forwarder's mistakes, not a forwarder that
+  deliberately writes a forged fingerprint line. Everything here runs as one user, which is the same
+  boundary the exit-code marker has always had.
+- **Codex reviewer: the `sol` family, newest listed version.** Both config heredocs of
+  `dual-audit-codex` now carry a placeholder, and each dispatch resolves `MODEL_FAMILY="sol"` to the
+  newest `gpt-<version>-sol` whose `visibility` is `list` in the models cache
+  (`~/.codex/models_cache.json`, or `DUAL_AUDIT_MODELS_CACHE`) and that supports `high` effort —
+  `gpt-6-sol` at release, where 1.3.1 fixed `gpt-5.6-sol`. Versions compare as numbers. If nothing
+  in the family resolves, the wrapper refuses with exit 96 rather than fall back to another model.
+  The wrapper also refuses, with exit 8, every option that would override that choice after the
+  fact: `-m`/`--model`, `-c`/`--config`, `-p`/`--profile`, `--oss`, `--local-provider`, and
+  `--ignore-user-config` (which would drop the config that pins the model). Until 1.3.1 these were
+  passed through to Codex.
+- **Families, not versions.** A full model ID pinned in code stays fixed and goes stale without any
+  error once that model is superseded. An alias is resolved when a seat starts — in this release's
+  test run `opus` resolved to the current Opus model — and the reviewer's version is resolved from
+  the models cache on every dispatch.
+
 ## [1.3.1]
 
 **The cap model was stricter than the parser it models.** The wrapper reads `BASH_MAX_TIMEOUT_MS` to

@@ -123,6 +123,7 @@ silently becomes the default can buy *looser* runtime parameters than the user a
 | `DUAL_AUDIT_CODEX_BIN` | PATH lookup, then `~/.local/bin/codex` | |
 | `DUAL_AUDIT_RUNTIME_DIR` | `/tmp/dual-audit-<uid>` | must be absolute |
 | `DUAL_AUDIT_STATE_DIR` | `$XDG_STATE_HOME/dual-audit` | |
+| `DUAL_AUDIT_MODELS_CACHE` | `~/.codex/models_cache.json` | where the newest reviewer version of `MODEL_FAMILY` (`sol`) is looked up; nothing resolvable exits 96 |
 | `DUAL_AUDIT_TELEMETRY` | **unset = telemetry OFF** | must be an absolute path to enable |
 
 ### The caller's ceiling, and the three variables that share it

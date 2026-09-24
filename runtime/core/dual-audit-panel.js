@@ -1510,13 +1510,19 @@ async function budgetedAgent(kind, role, prompt, rs) {
   let dispatchPrompt, opts
   if (kind === 'codex') {
     dispatchPrompt = codexRoForward(fullTask, tag)
-    opts = { label: `codex-ro:${role}:r${rs.n}`, phase: `Round ${rs.n}`, agentType: 'claude', model: 'haiku' }
+    // UNREACHABLE on this build: 'forward' mode is orphaned (see CODEX_MODE), and the forwarder that
+    // actually runs is dispatched by the driver, which names the same model. Kept in step so that
+    // restoring forward mode cannot revive a stale pin. Pin model ALIASES, never full model IDs: an ID
+    // stays fixed and goes stale silently once that model is superseded.
+    opts = { label: `codex-ro:${role}:r${rs.n}`, phase: `Round ${rs.n}`, agentType: 'claude', model: 'opus' }
   } else {
     dispatchPrompt = fullTask
     // Effort is pinned to high and no longer inherits the session setting. The codex side is pinned
     // to high by its own config, and this keeps both sides at the same level - cost is controlled by
     // seat count and round count, not by lowering effort. Covers the Claude auditor seats.
-    opts = { label: `claude:${role}:r${rs.n}`, phase: `Round ${rs.n}`, effort: 'high' }
+    // Model is pinned to the 'opus' alias for the same reason: left unset, the reviewer silently becomes
+    // whatever model the calling session runs, so a session on a lighter model reviews with that model.
+    opts = { label: `claude:${role}:r${rs.n}`, phase: `Round ${rs.n}`, effort: 'high', model: 'opus' }
   }
   let raw
   try { raw = await agent(dispatchPrompt, opts) }

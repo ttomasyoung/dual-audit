@@ -317,6 +317,90 @@ const LAUNCHED_RE = /^[ \t]*__DUAL_AUDIT_LAUNCHED=/m
 // Same marker, value captured: the seconds the wrapper actually granted the reviewer (long-seat check).
 const LAUNCHED_VALUE_RE = /^[ \t]*__DUAL_AUDIT_LAUNCHED=([0-9]+)[ \t]*$/gm   // /g: the LAST marker is read (a retried seat prints two)
 
+// Brief fingerprint. The wrapper hashes the brief it fed the reviewer and writes __BRIEF_SHA256=<hex>
+// next to the exit-code line inside the verdict block; this side hashes the text it handed the
+// forwarder. Both hash the same canonical form: each line's trailing blanks and any leading/trailing
+// empty lines dropped, then UTF-8. Self-contained SHA-256 because the workflow runtime has no crypto.
+const BRIEF_SHA_RE = /^[ \t]*__BRIEF_SHA256=([0-9a-f]*)[ \t]*$/gm
+const SHA256_K = (() => {
+  const k = []
+  for (let n = 2; k.length < 64; n++) {
+    let prime = true
+    for (let i = 2; i * i <= n; i++) if (n % i === 0) { prime = false; break }
+    if (prime) k.push(Math.floor((Math.cbrt(n) % 1) * 4294967296) >>> 0)
+  }
+  return k
+})()
+function sha256Hex(str) {
+  const bytes = []
+  for (let i = 0; i < str.length; i++) {
+    let c = str.charCodeAt(i)
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+      const d = str.charCodeAt(i + 1)
+      if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++ }
+    }
+    if (c < 0x80) bytes.push(c)
+    else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 63))
+    else if (c < 0x10000) bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63))
+    else bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63))
+  }
+  const len = bytes.length
+  bytes.push(0x80)
+  while (bytes.length % 64 !== 56) bytes.push(0)
+  const hi = Math.floor(len / 0x20000000), lo = (len * 8) >>> 0
+  bytes.push((hi >>> 24) & 255, (hi >>> 16) & 255, (hi >>> 8) & 255, hi & 255,
+    (lo >>> 24) & 255, (lo >>> 16) & 255, (lo >>> 8) & 255, lo & 255)
+  let H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+  const w = new Array(64)
+  const rot = (x, n) => (x >>> n) | (x << (32 - n))
+  for (let off = 0; off < bytes.length; off += 64) {
+    for (let t = 0; t < 16; t++) {
+      w[t] = (bytes[off + 4 * t] << 24) | (bytes[off + 4 * t + 1] << 16) | (bytes[off + 4 * t + 2] << 8) | bytes[off + 4 * t + 3]
+    }
+    for (let t = 16; t < 64; t++) {
+      const s0 = rot(w[t - 15], 7) ^ rot(w[t - 15], 18) ^ (w[t - 15] >>> 3)
+      const s1 = rot(w[t - 2], 17) ^ rot(w[t - 2], 19) ^ (w[t - 2] >>> 10)
+      w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0
+    }
+    let [a, b, c, d, e, f, g, h] = H
+    for (let t = 0; t < 64; t++) {
+      const t1 = (h + (rot(e, 6) ^ rot(e, 11) ^ rot(e, 25)) + ((e & f) ^ (~e & g)) + SHA256_K[t] + w[t]) | 0
+      const t2 = ((rot(a, 2) ^ rot(a, 13) ^ rot(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0
+      h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0
+    }
+    H = [H[0] + a, H[1] + b, H[2] + c, H[3] + d, H[4] + e, H[5] + f, H[6] + g, H[7] + h].map(v => v | 0)
+  }
+  return H.map(v => (v >>> 0).toString(16).padStart(8, '0')).join('')
+}
+function canonicalBrief(s) {
+  const lines = String(s == null ? '' : s).split('\n').map(l => l.replace(/[ \t\r]+$/, ''))
+  while (lines.length && lines[lines.length - 1] === '') lines.pop()
+  while (lines.length && lines[0] === '') lines.shift()
+  return lines.join('\n')
+}
+// null when the last verdict block carries exactly one fingerprint equal to the text that was sent;
+// otherwise { code, why }. Read from the LAST block, like the exit code, and for the same reasons.
+function briefShaMismatch(text, sent) {
+  const blocks = String(text == null ? '' : text).match(BLOCK_RE) || []
+  if (!blocks.length) return { code: 'BRIEF_SHA_NO_BLOCK', why: 'no VERDICT..END block to read a brief fingerprint from' }
+  const hits = []
+  let m
+  BRIEF_SHA_RE.lastIndex = 0
+  while ((m = BRIEF_SHA_RE.exec(blocks[blocks.length - 1])) !== null) hits.push(m[1])
+  if (hits.length === 0) {
+    return { code: 'BRIEF_SHA_MISSING', why: 'the last verdict block has no __BRIEF_SHA256 line, so nothing shows the reviewer received the brief this driver sent (an old wrapper, or the forwarder dropped the line)' }
+  }
+  if (hits.length > 1) return { code: 'BRIEF_SHA_AMBIGUOUS', why: `the last verdict block has ${hits.length} __BRIEF_SHA256 lines` }
+  const want = sha256Hex(canonicalBrief(sent))
+  if (hits[0] !== want) {
+    return {
+      code: 'BRIEF_MISMATCH',
+      why: `the reviewer received a different text from the one this driver sent (fingerprint ${hits[0].slice(0, 12) || 'empty'}… vs ${want.slice(0, 12)}…): the forwarder changed the brief on the way — for example by pasting the harness's relayed user message — so this verdict is about some other text and is refused`,
+    }
+  }
+  return null
+}
+
 // Take the LAST VERDICT..END block (the panel picks the same one) and require
 // EXACTLY ONE marker inside it. Zero means the marker was dropped or the wrapper ran
 // without --emit-rc; more than one is ambiguous. Both return null, and the panel
@@ -418,6 +502,8 @@ while (calls < MAX_PANEL_CALLS) {
     })
   }
 
+  // The exact text the forwarder receives; the brief fingerprint is checked against this value.
+  const sentText = seatParamsLine ? seatParamsLine + '\n' + String(brief) : String(brief)
   let out = null
   try {
     // The brief already carries its own sentinel contract (rawSourceBrief and
@@ -428,8 +514,16 @@ while (calls < MAX_PANEL_CALLS) {
     // Do NOT add exit-code fields here. A model can report them consistently wrongly,
     // and two self-reported fields are not two sources. The only exit-code source is
     // rcInsideVerdictBlock above.
-    out = await agent(seatParamsLine ? seatParamsLine + '\n' + String(brief) : String(brief), {
+    out = await agent(sentText, {
       agentType: 'dual-audit-codex-readonly',
+      // Named at the call site rather than left to the agent definition's frontmatter: in a measured
+      // run, after the frontmatter was edited mid-session, the seat still ran the calling session's model.
+      // Opus, not a cheaper tier. Measured: a haiku forwarder never ran the wrapper (2 of 2 calls) and
+      // returned its own review as the reviewer's verdict; sonnet forwarders ran it but pasted the harness's
+      // relayed user message in 2 of the 3 calls where it was present - that message claims precedence over
+      // the task, so the reviewer answered it instead of auditing. Opus forwarders pasted only the brief in
+      // every recorded run.
+      model: 'opus',
       label: `codex-ro:call${calls}`,
       phase: 'Dual audit',
       schema: {
@@ -439,7 +533,7 @@ while (calls < MAX_PANEL_CALLS) {
           verdict_text: {
             type: 'string',
             description: 'The reviewer stdout, copied verbatim: do not rewrite, abbreviate or summarise it. '
-              + 'It MUST contain the complete VERDICT..END block, and the __DUAL_AUDIT_RC= line inside that '
+              + 'It MUST contain the complete VERDICT..END block, and the __DUAL_AUDIT_RC= and __BRIEF_SHA256= lines inside that '
               + 'block must be preserved exactly — the wrapper wrote it, and removing it makes this audit fail.',
           },
         },
@@ -461,6 +555,22 @@ while (calls < MAX_PANEL_CALLS) {
   // The marker line is NOT stripped: the driver forwards verdict text verbatim. The
   // panel treats it as one unparsed note plus a warning; the block stays valid.
   codexExitCode = rcInsideVerdictBlock(verdictText)
+  // Brief fingerprint: the reviewer must have received exactly sentText. A verdict about some other
+  // text (the forwarder pasted the harness's relayed chat, dropped or rewrote lines) is refused the same
+  // way as a verdict without an exit code, with its own diagnostic so the cause is not misread.
+  const briefMismatch = codexExitCode === null ? null : briefShaMismatch(verdictText, sentText)
+  if (briefMismatch) {
+    // Built field by field on purpose: the marker diagnostic below spells these fields as object-literal
+    // lines, and the regression suite mutates THOSE lines by their first occurrence. An identical literal
+    // here would sit first and silently absorb the mutation.
+    const diag = { call: calls, code: briefMismatch.code, why: `call${calls}: ${briefMismatch.why}` }
+    diag.superseded_by_call = null
+    diag.verdict_text_len = String(verdictText).length
+    diag.verdict_text_tail = String(verdictText).slice(-160)
+    rcDiagnostics.push(diag)
+    log(`call${calls}: ${briefMismatch.code} -> exit code withheld, the panel will treat this attempt as unavailable`)
+    codexExitCode = null
+  }
   // 🔴 When one reviewer attempt fails and a later one succeeds, the earlier diagnostic must be
   //    marked SUPERSEDED. Measured incident: a round ran the reviewer twice - the first attempt was
   //    killed by a caller-imposed wall-clock ceiling and emitted only a forwarder status report (no
@@ -502,7 +612,7 @@ while (calls < MAX_PANEL_CALLS) {
     if (!applied) log(`call${calls}: long seat NOT applied — asked for ${seatTimeoutS}s, wrapper announced ${launched == null ? 'no __DUAL_AUDIT_LAUNCHED line' : launched + 's'}; the verdict is forwarded as usual but the extra time was not used`)
   }
 
-  if (codexExitCode === null) {
+  if (codexExitCode === null && !briefMismatch) {
     // Diagnostics must travel in the RETURN VALUE, not only in a log line. The first
     // time this mechanism shipped, one code path failed to inject the marker and every
     // round failed closed, while the panel result said only "codex produced no

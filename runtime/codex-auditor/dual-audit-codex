@@ -25,6 +25,8 @@
 #   99  no slot or lock available. (The reviewer itself can also return 99; the wrapper
 #       cannot distinguish the two and records rc99_unattributed in telemetry.)
 #   98  token admission failed (--preflight / --batch).
+#   96  no reviewer model: the models cache lists no gpt-<version>-<MODEL_FAMILY> that supports
+#       high effort, or the cache cannot be read. Refused, never downgraded to another model.
 #   124, 137  timed out OR the child was killed. These are TIMEOUT-LIKE, not proof of a
 #       timeout: the reviewer can return 124 itself, and 137 also comes from the OOM
 #       killer or an external SIGKILL.
@@ -37,6 +39,7 @@
 #   DUAL_AUDIT_EXP_MARGIN (900, <=604800)  DUAL_AUDIT_STDIN_TIMEOUT (120, <=3600)
 #   DUAL_AUDIT_MODE (isolated|serial)      DUAL_AUDIT_BATCH (0|1)
 #   DUAL_AUDIT_CODEX_BIN, DUAL_AUDIT_RUNTIME_DIR, DUAL_AUDIT_STATE_DIR
+#   DUAL_AUDIT_MODELS_CACHE (~/.codex/models_cache.json)  where the reviewer version is looked up
 #   DUAL_AUDIT_TELEMETRY  absolute path to a JSONL file. UNSET = telemetry OFF, which is
 #       the default. Telemetry records timing, waiting, mode and an exit category only —
 #       never a brief, argv, path, environment value, or anything derived from the token.
@@ -90,6 +93,8 @@ SRC_AUTH="$HOME/.codex/auth.json"; [ -f "$SRC_AUTH" ] || SRC_AUTH="$HOME/.codex-
 # Cap the credential file size, so a malformed huge file cannot pin CPU or memory
 if [ -f "$SRC_AUTH" ]; then _sz=$(stat -c%s "$SRC_AUTH" 2>/dev/null || echo 0); [ "$_sz" -gt 1048576 ] && { echo "dual-audit-codex: $SRC_AUTH is unexpectedly large (>1MB); refusing to run" >&2; exit 3; }; fi
 AUDIT_HOME="$STATE_DIR/serial-codex-home"
+MODEL_FAMILY="sol"   # reviewer family, pinned; the VERSION is the newest listed in the models cache, resolved per dispatch
+MODELS_CACHE="${DUAL_AUDIT_MODELS_CACHE-$HOME/.codex/models_cache.json}"
 LOCK="${RUNTIME_DIR}/.dual-audit.lock"
 SLOT_DIR="${RUNTIME_DIR}/.dual-audit-slots"
 MODE="${DUAL_AUDIT_MODE-isolated}"   # Uses ${x-} not ${x:-}: an explicitly EMPTY value counts as "explicitly set" and must be refused
@@ -300,6 +305,38 @@ if [ "$PREFLIGHT" = 1 ] && [ "${#ARGS[@]}" -gt 0 ]; then
   printf 'dual-audit-codex: --preflight is pre-batch admission only and cannot be combined with an exec request (extra arguments: %s); refusing to run\n' "${ARGS[*]}" >&2
   exit 8
 fi
+
+# ---- Only the brief on stdin, and no reviewer model or config from the caller ----------------------
+# The brief fingerprint in the verdict block covers stdin alone, and the reviewer reads a command-line
+# prompt TOGETHER with stdin. So a prompt on the command line - a second positional after the
+# subcommand, or anything after `--` - would reach the reviewer unchecked. And the reviewer model is
+# this wrapper's to choose (family pin + newest version): -m/-c/-p/--oss/--local-provider would
+# override it, and --ignore-user-config would drop the config this wrapper writes, falling back to the
+# CLI's default model without a word. Value-taking options are skipped with their value; the list is the
+# union of codex 0.156 `exec --help` and top-level `codex --help` (top-level options may precede the
+# subcommand). An option missing from it makes its value look like a prompt, which refuses a call
+# rather than admitting one.
+_guard_prompt_and_model(){
+  local a skip=0 seen_sub=0 i=0 n=$#
+  for a in "$@"; do
+    i=$((i+1))
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+      --) [ "$i" -lt "$n" ] && { printf '%s\n' "dual-audit-codex: a prompt after -- is not allowed: the brief goes on stdin (-) only, which is what the fingerprint covers; refusing to run" >&2; return 1; }
+          return 0 ;;
+      -m|--model|-c|--config|-p|--profile|--local-provider|--oss|--ignore-user-config|\
+      -m?*|-c?*|-p?*|--model=*|--config=*|--profile=*|--local-provider=*)
+          printf '%s\n' "dual-audit-codex: $a is not allowed: the reviewer model and its configuration are set by this wrapper (family pin, newest version); refusing to run" >&2; return 1 ;;
+      -s|--sandbox|-i|--image|--enable|--disable|-C|--cd|--add-dir|--thread-source|\
+      --output-schema|--color|-o|--output-last-message|-a|--ask-for-approval|--remote|--remote-auth-token-env)
+          skip=1 ;;
+      -*) ;;
+      *) if [ "$seen_sub" = 0 ]; then seen_sub=1; else printf '%s\n' "dual-audit-codex: a prompt on the command line is not allowed (${a:0:40}): the brief goes on stdin (-) only, which is what the fingerprint covers; refusing to run" >&2; return 1; fi ;;
+    esac
+  done
+  return 0
+}
+if [ "$PREFLIGHT" != 1 ] && [ "$#" -gt 0 ]; then _guard_prompt_and_model "$@" || exit 8; fi
 # ---- A review must be requested read-only, explicitly. Omitting the flag leaves the mode to the
 #   real CLI's own default, which is not a promise this wrapper can make on the caller's behalf —
 #   and "read-only unless someone forgot" is exactly the guarantee the documentation does NOT make.
@@ -307,6 +344,46 @@ if [ "$PREFLIGHT" != 1 ] && [ "${#ARGS[@]}" -gt 0 ] && [ "$SANDBOX_OK" != 1 ]; t
   echo "dual-audit-codex: a review must be requested with --sandbox read-only; refusing to run" >&2
   exit 8
 fi
+
+# ---- Reviewer model: the family is pinned, the version follows the models cache ------------------
+# The config heredocs below carry the placeholder @CODEX_MODEL@. Each dispatch resolves MODEL_FAMILY to
+# the newest LISTED gpt-<version>-<family> that supports high effort; versions compare numerically
+# (10 > 9). Nothing resolvable -> refuse with 96. Falling back to another model would be the silent
+# downgrade this whole package exists to prevent.
+_resolve_model(){
+  timeout 30 python3 - "$MODELS_CACHE" "$MODEL_FAMILY" high <<'PY'
+import json, re, sys
+path, family, effort = sys.argv[1:4]
+try:
+    models = json.load(open(path, encoding="utf-8")).get("models") or []
+except (OSError, ValueError, AttributeError) as e:
+    sys.stderr.write("cannot read the models cache %s (%s)\n" % (path, e.__class__.__name__)); sys.exit(1)
+pat = re.compile(r"^gpt-(\d+(?:\.\d+)*)-%s$" % re.escape(family))
+best, LISTED = None, "list"
+for m in models:
+    mm = pat.match(m.get("slug") or "")
+    if not mm or m.get("visibility") != LISTED:   # missing or empty is NOT listed
+        continue
+    levels = [d.get("effort") if isinstance(d, dict) else d for d in (m.get("supported_reasoning_levels") or [])]
+    if effort not in levels:
+        continue
+    key = tuple(int(x) for x in mm.group(1).split("."))
+    if best is None or key > best[0]:
+        best = (key, m["slug"])
+if best is None:
+    sys.stderr.write("no listed gpt-<version>-%s model supports %s effort in %s\n" % (family, effort, path)); sys.exit(1)
+print(best[1])
+PY
+}
+CODEX_MODEL=$(_resolve_model) || { echo "dual-audit-codex: could not resolve the newest $MODEL_FAMILY reviewer model; refusing" >&2; exit 96; }
+case "$CODEX_MODEL" in
+  ""|*[!A-Za-z0-9._-]*) echo "dual-audit-codex: resolved an unusable model name (${CODEX_MODEL:-empty}); refusing" >&2; exit 96 ;;
+esac
+# _fill_model <config.toml>: put the resolved model into the placeholder, and prove it landed exactly once.
+_fill_model(){
+  sed -i "s/^model = \"@CODEX_MODEL@\"\$/model = \"$CODEX_MODEL\"/" "$1" || return 1
+  [ "$(grep -cFx "model = \"$CODEX_MODEL\"" "$1")" = 1 ] && ! grep -qF '@CODEX_MODEL@' "$1"
+}
 
 # ---- Remaining token lifetime in seconds; -1 when it cannot be parsed. Shared by preflight and the post-slot check so the two cannot drift ----
 _token_remaining(){
@@ -526,12 +603,30 @@ _guard_path(){ # $1=path $2=kind(file|dir); symlinks (including dangling ones) a
 #       prose does not attract a marker (a marker outside a block reads as absent anyway).
 # If there is no block at all (the reviewer crashed or produced nothing), the marker is
 #   appended at the end, so the exit code always has somewhere to land.
+# _brief_sha <file>: sha256 of the brief exactly as the reviewer was fed it, in canonical form (each
+# line's trailing blanks and any leading/trailing empty lines dropped, UTF-8). The driver computes the
+# same value over the text it handed the forwarder; a difference means the forwarder changed the brief
+# on the way (for example by pasting the harness's relayed chat), so the verdict is about another text.
+# Empty on failure, which the driver reads as a mismatch: this can only fail closed.
+_brief_sha(){
+  timeout 30 python3 - "$1" <<'PY' 2>/dev/null
+import hashlib, sys
+t = open(sys.argv[1], encoding="utf-8", errors="surrogateescape", newline="").read()   # no newline translation: same text the driver hashes
+lines = [l.rstrip(" \t\r") for l in t.split("\n")]
+while lines and lines[-1] == "":
+    lines.pop()
+while lines and lines[0] == "":
+    lines.pop(0)
+print(hashlib.sha256("\n".join(lines).encode("utf-8", "surrogateescape")).hexdigest())
+PY
+}
+
 _emit_rc_inject(){   # $1=rc; stdin=reviewer stdout; stdout=the same text with the exit-code marker injected
-  awk -v rc="$1" '
+  awk -v rc="$1" -v bsha="$2" '
     $0 ~ /^[ \t]*VERDICT:/ { inblk=1 }
-    inblk && $0 ~ /^[ \t]*END[ \t]*$/ { printf "__DUAL_AUDIT_RC=%s\n", rc; inblk=0; any=1 }
+    inblk && $0 ~ /^[ \t]*END[ \t]*$/ { printf "__BRIEF_SHA256=%s\n__DUAL_AUDIT_RC=%s\n", bsha, rc; inblk=0; any=1 }
     { print }
-    END { if (!any) printf "__DUAL_AUDIT_RC=%s\n", rc }
+    END { if (!any) printf "__BRIEF_SHA256=%s\n__DUAL_AUDIT_RC=%s\n", bsha, rc }
   '
 }
 
@@ -609,7 +704,7 @@ run_serial(){
   cp -f "$SRC_AUTH" "$AUDIT_HOME/auth.json" 2>/dev/null || { echo "dual-audit-codex(serial): authentication file not found ($SRC_AUTH)" >&2; exit 3; }
   chmod 600 "$AUDIT_HOME/auth.json"
   cat > "$AUDIT_HOME/config.toml" <<'EOF' || { echo "dual-audit-codex(serial): could not write config" >&2; exit 6; }
-model = "gpt-5.6-sol"
+model = "@CODEX_MODEL@"
 model_reasoning_effort = "high"
 [features]
 use_legacy_landlock = true
@@ -617,6 +712,7 @@ memories = false
 [projects."/tmp"]
 trust_level = "trusted"
 EOF
+  _fill_model "$AUDIT_HOME/config.toml" || { echo "dual-audit-codex(serial): could not write the model into the config" >&2; exit 6; }
   if [ -L "$AUDIT_CWD" ] || [ ! -O "$AUDIT_CWD" ]; then echo "dual-audit-codex(serial): the neutral working directory is unsafe (symlink, or not owned by this user)" >&2; exit 8; fi
   _anc="$AUDIT_CWD"; while :; do [ -e "$_anc/.codex/superpowers" ] && { echo "dual-audit-codex(serial): an ancestor directory carries injectable skill configuration" >&2; exit 8; }; [ "$_anc" = "/" ] && break; _anc=$(dirname "$_anc"); done
   cd "$AUDIT_CWD" || { echo "dual-audit-codex(serial): cd failed" >&2; exit 7; }
@@ -633,10 +729,11 @@ EOF
     if [ "$EMIT_RC" = 1 ]; then
       # rc MUST be captured BEFORE the pipe: once `| _emit_rc_inject` is appended, $? is
       #   awk's exit code, not the reviewer's.
-      local _so
+      local _so _bsha
+      _bsha=$(_brief_sha "$STDIN_SNAP")
       _so=$(timeout -k "$KILL_AFTER" "$TIMEOUT" env HOME="$FAKE_HOME" CODEX_HOME="$AUDIT_HOME" "$REAL_CODEX" ${_sargs+"${_sargs[@]}"} < "$STDIN_SNAP" 200>&-)
       _rc=$?
-      printf '%s\n' "$_so" | _emit_rc_inject "$_rc"
+      printf '%s\n' "$_so" | _emit_rc_inject "$_rc" "$_bsha"
     else
       timeout -k "$KILL_AFTER" "$TIMEOUT" env HOME="$FAKE_HOME" CODEX_HOME="$AUDIT_HOME" "$REAL_CODEX" ${_sargs+"${_sargs[@]}"} < "$STDIN_SNAP" 200>&-
       _rc=$?
@@ -753,7 +850,7 @@ json.dump(d, open(sys.argv[2],"w"))
 PY
 chmod 600 "$RUN_ROOT/auth.json"
 cat > "$RUN_ROOT/config.toml" <<'EOF' || { echo "dual-audit-codex: could not write the private config" >&2; exit 6; }
-model = "gpt-5.6-sol"
+model = "@CODEX_MODEL@"
 model_reasoning_effort = "high"
 [features]
 use_legacy_landlock = true
@@ -761,9 +858,11 @@ memories = false
 [projects."/tmp"]
 trust_level = "trusted"
 EOF
+_fill_model "$RUN_ROOT/config.toml" || { echo "dual-audit-codex: could not write the model into the private config" >&2; exit 6; }
 
 # Move the already-snapshotted brief into place (no time-of-use gap, it is on disk already) and clear the variable so cleanup does not remove it twice
 mv "$STDIN_SNAP" "$RUN_ROOT/brief.md" || { echo "dual-audit-codex: could not move the brief into place" >&2; exit 6; }
+_BSHA=$(_brief_sha "$RUN_ROOT/brief.md")
 STDIN_SNAP=""
 
 # Private working-directory checks: symlink, ownership, and no injectable skill configuration anywhere up the ancestor chain
@@ -800,7 +899,7 @@ if [ "$EMIT_RC" = 1 ]; then
   _EMIT_OUT=$(timeout -k "$KILL_AFTER" "$TIMEOUT" \
     env HOME="$EHOME" CODEX_HOME="$RUN_ROOT" "$REAL_CODEX" ${NEWARGS+"${NEWARGS[@]}"} < "$RUN_ROOT/brief.md" 9>&-)
   RC=$?                  # MUST be captured before the pipe: once `| _emit_rc_inject` is added, $? is awk exit code
-  printf '%s\n' "$_EMIT_OUT" | _emit_rc_inject "$RC"   # injection rules are defined at _emit_rc_inject
+  printf '%s\n' "$_EMIT_OUT" | _emit_rc_inject "$RC" "$_BSHA"   # injection rules are defined at _emit_rc_inject
   unset _EMIT_OUT
 else
   timeout -k "$KILL_AFTER" "$TIMEOUT" \

@@ -139,7 +139,8 @@ for a further round, so the panel escalates rather than converging. That is the 
 ## The exit-code marker
 
 The driver returns `rc_diagnostics` whenever it could not read `__DUAL_AUDIT_RC=` from inside the
-verdict block. Each entry carries a `code` and a `why`. The causes are distinguished because they
+verdict block, or could not confirm from the `__BRIEF_SHA256=` line beside it that the reviewer
+received exactly the brief the driver sent. Each entry carries a `code` and a `why`. The causes are distinguished because they
 need different fixes:
 
 | `code` | `why`, in short | Fix |
@@ -152,6 +153,9 @@ need different fixes:
 | `MARKER_IN_EARLIER_BLOCK` | the marker is in an earlier block, not the last | The reviewer printed its verdict more than once with inconsistent injection. |
 | `MARKER_AMBIGUOUS_IN_LAST_BLOCK` | several markers in the last block | Ambiguous; refused fail-closed. |
 | `MARKER_UNREADABLE_INTERNAL_INCONSISTENCY` | exactly one marker in the last block, and it still would not parse | A bug here, not in your setup. Please report it with the reviewer output. |
+| `BRIEF_MISMATCH` | the brief fingerprint in the last block differs from the text the driver dispatched | The forwarder changed the brief on the way — most often by pasting the harness's relayed user message along with it — so the verdict is about some other text and is refused. The driver names the forwarder's model (`opus`); a session reads agent definitions when it starts, so an edited definition takes effect in a new session. |
+| `BRIEF_SHA_MISSING` | an exit code, but no brief fingerprint in the last block | A wrapper older than 1.4.0, or a forwarder that dropped the line. Update the wrapper; if it is current, the forwarder did not copy the block verbatim. |
+| `BRIEF_SHA_AMBIGUOUS` | several fingerprints in the last block | Ambiguous; refused fail-closed. |
 
 **`code` is a contract; `why` is not.** Branch on `code` in scripts and assertions — the literals
 never change meaning, and new ones are only ever added. The `why` sentence is for humans and may be
@@ -165,10 +169,11 @@ language went red everywhere while every behaviour was identical.
 |---|---|
 | 99 | No slot or lock available. (The reviewer can also return 99 itself; the wrapper cannot tell them apart.) |
 | 98 | Token admission failed (`--preflight` or `--batch`). |
+| 96 | No reviewer model: the models cache (`~/.codex/models_cache.json`, or `DUAL_AUDIT_MODELS_CACHE`) lists no `gpt-<version>-<MODEL_FAMILY>` that supports `high` effort, or cannot be read. Refused rather than downgraded to another model; run `codex` once to refresh the cache, or change `MODEL_FAMILY` at the top of the wrapper. |
 | 97 | The caller's wall-clock ceiling (`DUAL_AUDIT_OUTER_BUDGET`) was already spent before the reviewer could start — usually setup plus queueing. **This is the wrapper refusing on purpose**, so that the failure arrives as a readable message instead of the caller killing the command into an empty stdout. If you see it often, the review is queueing: lower `DUAL_AUDIT_MAX_PAR`, or raise the budget if your caller genuinely has no ceiling. |
 | 124, 137 | Timed out **or** the child was killed. Timeout-*like*, not proof of a timeout: the reviewer can return 124 itself, and 137 also comes from the OOM killer or an external kill. |
 | 9 | stdin was an empty TTY, or the brief was zero bytes. |
-| 8 | A bad argument, a malformed environment value, or a failed path guard. |
+| 8 | A bad argument, a malformed environment value, or a failed path guard — including a prompt on the command line (the brief goes on stdin only) and any option that would override the reviewer model (`-m`, `-c`, `-p`, `--oss`, `--local-provider`, `--ignore-user-config`). |
 | 7 | Could not enter the private working directory. |
 | 3-6 | Bootstrap failure (credentials, config, temporary files). |
 | other | The reviewer's own exit code, passed through. |

@@ -6,7 +6,10 @@
 // require it to FAIL, which is what proves the assertion has teeth.
 //
 // Run: node tests/test_driver.mjs      (exit 0 = all green, 1 = failures)
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { tmpdir } from 'node:os'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
@@ -25,6 +28,21 @@ const ENVP = process.env.DUAL_AUDIT_ENVP || 'DUAL_AUDIT'
 const SRC0 = readFileSync(DRIVER, 'utf8').replace('export const meta', 'const meta')
 const AF = Object.getPrototypeOf(async function () {}).constructor
 
+// The wrapper writes __BRIEF_SHA256=<sha256 of the brief it fed the reviewer> on the line above every
+// exit-code marker. The stub below does the same over the prompt the forwarder was handed, so a normal
+// case looks like production. A case that supplies its own __BRIEF_SHA256 line is left untouched: that
+// is how the refusal cases hand the driver a fingerprint of some other text.
+const canonBrief = (t) => {
+  const lines = String(t).split('\n').map(l => l.replace(/[ \t\r]+$/, ''))
+  while (lines.length && lines[lines.length - 1] === '') lines.pop()
+  while (lines.length && lines[0] === '') lines.shift()
+  return lines.join('\n')
+}
+const shaOf = (t) => createHash('sha256').update(canonBrief(t), 'utf8').digest('hex')
+const RCM_LINE = new RegExp('^([ \\t]*' + RCM + '=.*)$', 'gm')
+const injectBriefSha = (text, prompt) => (typeof text !== 'string' || /__BRIEF_SHA256=/.test(text))
+  ? text : text.replace(RCM_LINE, (line) => `__BRIEF_SHA256=${shaOf(prompt)}\n${line}`)
+
 // A verdict block carrying the wrapper-injected exit-code marker.
 const block = (rc, verdict = 'APPROVE') =>
   `VERDICT: ${verdict}\nP0: none\nEVIDENCE: read 3 files, 42 lines\nVERIFIED: pass\n${RCM}=${rc}\nEND`
@@ -34,7 +52,7 @@ const block = (rc, verdict = 'APPROVE') =>
  * panelReplies: array consumed one per panel call (or a function of call index).
  * agentReply:   string returned as the reviewer stdout, or a function of call index.
  */
-async function runDriver({ args = { task: 't' }, panelReplies = [], agentReply = '', mutate = null } = {}) {
+async function runDriver({ args = { task: 't' }, panelReplies = [], agentReply = '', mutate = null, injectSha = true } = {}) {
   const src = mutate ? mutate(SRC0) : SRC0
   const calls = { panel: 0, agent: 0 }
   const panelArgsSeen = []
@@ -50,7 +68,7 @@ async function runDriver({ args = { task: 't' }, panelReplies = [], agentReply =
     agentPrompts.push(String(prompt))
     const i = calls.agent++
     const t = typeof agentReply === 'function' ? agentReply(i) : agentReply
-    return { verdict_text: t }
+    return { verdict_text: injectSha ? injectBriefSha(t, prompt) : t }
   }
   const fn = new AF('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'workflow', src)
   const r = await fn(args, agent, async (t) => Promise.all(t.map(x => x())), () => {}, () => {},
@@ -395,8 +413,8 @@ await t('D1 codex_timeout_s prefixes the forwarder prompt with ONE seat-params l
 await t('D2 without codex_timeout_s the forwarder prompt is exactly the brief (the default lane is untouched)',
   (m) => runDriver({ panelReplies: [HANDOFF, DONE], agentReply: block(0), mutate: m }),
   (r, g) => g.agentPrompts[0] === 'BRIEF BODY' && r.terminal_state === 'CONVERGED',
-  (s) => s.replace("agent(seatParamsLine ? seatParamsLine + '\\n' + String(brief) : String(brief), {",
-                   "agent(seatParamsLine + '\\n' + String(brief), {"))
+  (s) => s.replace("const sentText = seatParamsLine ? seatParamsLine + '\\n' + String(brief) : String(brief)",
+                   "const sentText = seatParamsLine + '\\n' + String(brief)"))
 
 // Present-with-a-bad-value is refused; only ABSENT selects the default. null, '' and blanks are bad values:
 // a review showed the first version read them as omission, so a caller who wrote the key and left it empty
@@ -463,6 +481,81 @@ await t('D8 without the key no long_seat entry is written (the diagnostic belong
   (m) => runDriver({ panelReplies: [HANDOFF, DONE], agentReply: withLaunch(540), mutate: m }),
   (r) => !((r.driver_trace || []).some(x => x && x.long_seat)),
   (s) => s.replace('if (seatTimeoutS != null) {\n    let lm, launched = null', 'if (true) {\n    let lm, launched = null'))
+
+// ── E. Brief fingerprint: the reviewer must have received exactly the text the driver dispatched ──
+const withSha = (sha, rc = 0) => block(rc).replace(`\n${RCM}=`, `\n__BRIEF_SHA256=${sha}\n${RCM}=`)
+const codes = (r) => ((r && r.rc_diagnostics) || []).map(d => d.code)
+
+await t('E1 a verdict about some other text (fingerprint mismatch) is refused: no exit code reaches the panel',
+  (m) => runDriver({ panelReplies: [HANDOFF, DONE], agentReply: withSha(shaOf('[Workflow harness — user request] ...\nBRIEF BODY')), mutate: m }),
+  (r, g) => g.panelArgsSeen[1] && !('codex_exit_code' in g.panelArgsSeen[1]) && codes(r).includes('BRIEF_MISMATCH'),
+  (s) => s.replace('briefShaMismatch(verdictText, sentText)', 'null'))
+
+await t('E2 a verdict with no fingerprint line is refused as BRIEF_SHA_MISSING, not misfiled as a marker problem',
+  (m) => runDriver({ panelReplies: [HANDOFF, DONE], agentReply: block(0), injectSha: false, mutate: m }),
+  (r, g) => g.panelArgsSeen[1] && !('codex_exit_code' in g.panelArgsSeen[1])
+    && codes(r).includes('BRIEF_SHA_MISSING') && !codes(r).some(c => /^MARKER_|^NO_MARKER/.test(c)),
+  (s) => s.replace('if (codexExitCode === null && !briefMismatch) {', 'if (codexExitCode === null) {'))
+
+await t('E3 the fingerprint covers the seat-params line too: a hash of the brief alone is refused on a long seat',
+  (m) => runDriver({ args: { task: 't', codex_timeout_s: 2400 }, panelReplies: [HANDOFF, DONE], agentReply: withSha(shaOf('BRIEF BODY')), mutate: m }),
+  (r, g) => g.panelArgsSeen[1] && !('codex_exit_code' in g.panelArgsSeen[1]) && codes(r).includes('BRIEF_MISMATCH'),
+  (s) => s.replace("const sentText = seatParamsLine ? seatParamsLine + '\\n' + String(brief) : String(brief)",
+                   "const sentText = seatParamsLine ? String(brief) : String(brief)"))
+
+await t('E4 a correct fingerprint lets the exit code through unchanged',
+  (m) => runDriver({ panelReplies: [HANDOFF, DONE], agentReply: withSha(shaOf('BRIEF BODY'), 0), mutate: m }),
+  (r, g) => g.panelArgsSeen[1] && g.panelArgsSeen[1].codex_exit_code === 0 && r.terminal_state === 'CONVERGED',
+  (s) => s.replace('const want = sha256Hex(canonicalBrief(sent))', "const want = sha256Hex(canonicalBrief(sent + 'x'))"))
+
+// Non-ASCII, written as escapes so this file stays ASCII: a 2-byte, a 3-byte, a 3-byte CJK and a 4-byte
+// (surrogate pair) code point, plus a CR and trailing blanks the canonical form must drop. node's own
+// crypto computes the stub's fingerprint; the driver's hand-written SHA-256 must agree with it.
+const MB = 'caf\u00e9 \u2014 \u4e2d ' + String.fromCodePoint(0x1F600) + ' end  \r\nsecond\t\n'
+await t('E5 multi-byte text, CR and trailing blanks: the driver\'s SHA-256 agrees with node crypto',
+  (m) => runDriver({ panelReplies: [{ ...HANDOFF, codex_brief: MB }, DONE], agentReply: block(0), mutate: m }),
+  (r, g) => g.panelArgsSeen[1] && g.panelArgsSeen[1].codex_exit_code === 0 && !codes(r).length,
+  (s) => s.replace('c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++', 'i++'))
+
+// E6. Cross-language, end to end: the fingerprint in each reply is computed by the WRAPPER's own
+// _brief_sha (Python) on the same text, and the driver's SHA-256 (JS) must accept it on every
+// canonicalisation edge. A disagreement would refuse a faithful forward as BRIEF_MISMATCH.
+const WRAPPER = process.env.DUAL_AUDIT_WRAPPER || resolve(HERE, '../runtime/codex-auditor/dual-audit-codex')
+const SHA_DIR = mkdtempSync(resolve(tmpdir(), 'brief-sha-'))
+let shaN = 0
+const wrapperSha = (text) => {
+  const f = resolve(SHA_DIR, `b${shaN++}.txt`)
+  writeFileSync(f, text, 'utf8')
+  return execFileSync('bash', ['-c', 'source <(sed -n "/^_brief_sha(){/,/^}/p" "$1"); _brief_sha "$2"', '_', WRAPPER, f]).toString().trim()
+}
+const cp = (n) => String.fromCodePoint(n)
+const EDGE = [
+  'plain', '\n  \nlead blank lines', '\n\nblank edges\n\n\n', 'trailing blanks   \t\nnext',
+  'crlf line\r\nnext\r\n', 'mid-line\rCR stays\nsecond', 'tab\tinside',
+  'caf' + cp(0xe9) + ' ' + cp(0x2014) + ' ' + cp(0x4e2d) + ' ' + cp(0x1F600),
+  'x'.repeat(55), 'x'.repeat(56), 'x'.repeat(63), 'x'.repeat(64), 'x'.repeat(119),
+  cp(0x4e2d).repeat(19), cp(0x1F600).repeat(14), 'a\n'.repeat(40) + 'end',
+]
+let seed = 7
+const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff
+const ALPH = ['a', 'Z', ' ', '\t', '\n', '\r', cp(0xe9), cp(0x2014), cp(0x4e2d), cp(0x1F600), '0']
+for (let k = 0; k < 24; k++) {
+  let s = ''
+  const n = 1 + Math.floor(rnd() * 90)
+  for (let j = 0; j < n; j++) s += ALPH[Math.floor(rnd() * ALPH.length)]
+  EDGE.push(s)
+}
+await t(`E6 the wrapper's own fingerprint (Python) and the driver's (JS) agree on all ${EDGE.length} edge texts`,
+  async (m) => {
+    const bad = []
+    for (const v of EDGE) {
+      const g = await runDriver({ panelReplies: [{ ...HANDOFF, codex_brief: v }, DONE], agentReply: withSha(wrapperSha(v), 0), mutate: m })
+      if (!(g.panelArgsSeen[1] && g.panelArgsSeen[1].codex_exit_code === 0)) bad.push(JSON.stringify(v).slice(0, 40))
+    }
+    return { r: { bad } }
+  },
+  (r) => r.bad.length === 0,
+  (s) => s.replace("l.replace(/[ \\t\\r]+$/, '')", "l.replace(/[ \\t]+$/, '')"))
 
 console.log(`\n=== RESULT: ${pass} passed / ${fail} failed ===`)
 process.exit(fail ? 1 : 0)
